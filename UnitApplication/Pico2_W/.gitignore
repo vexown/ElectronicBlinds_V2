@@ -1,0 +1,7 @@
+build/
+**/cmake-*/
+output/binary_analysis_bootloader
+output/binary_analysis_moduri
+*_dump.bin
+StaticAnalysis_output.txt
+build.log
