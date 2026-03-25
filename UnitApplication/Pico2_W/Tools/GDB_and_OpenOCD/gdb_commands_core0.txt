@@ -1,0 +1,15 @@
+# Connect to the OpenOCD server running on localhost at port 3333
+target remote localhost:3333
+
+# Reset the MCU and halt execution immediately after the reset
+monitor reset halt
+
+# Load the program into the target device to ensure the 
+# latest version of your program is on the device.
+#load - currently disabled, uncomment to enable
+
+# Set a breakpoint at the main function
+break main
+
+# Start running the program
+continue

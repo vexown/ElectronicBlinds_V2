@@ -1,0 +1,8 @@
+# Connect to the OpenOCD server running on localhost at port 3334
+target remote localhost:3334
+
+# Reset the MCU and halt execution immediately after the reset
+monitor reset halt
+
+# Start running the program
+continue

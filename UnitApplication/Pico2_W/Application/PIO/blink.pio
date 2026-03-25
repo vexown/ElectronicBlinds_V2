@@ -1,0 +1,13 @@
+.program blink
+    pull block          ; Pull from FIFO to OSR (blocking)
+    mov x, osr         ; Copy OSR to X scratch register
+.wrap_target
+    set pins, 1        ; Turn LED on
+    mov y, x           ; Initialize Y delay counter from X
+delay_on:
+    jmp y--, delay_on  ; Delay for (X + 1) cycles
+    set pins, 0        ; Turn LED off
+    mov y, x          ; Reset Y delay counter
+delay_off:
+    jmp y--, delay_off ; Delay for (X + 1) cycles
+.wrap                  ; Loop forever
