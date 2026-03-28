@@ -56,19 +56,19 @@
  * Configuration
  */
 
-#define DEBOUNCE_MAX_BUTTONS  8    /* Max simultaneous buttons */
-#define DEBOUNCE_SAMPLE_MS    5    /* Timer tick interval in ms             
+#define DEBOUNCE_MAX_BUTTONS  8    // Max simultaneous buttons
+/* Timer tick interval in ms             
  * If you find your project in a very "noisy" environment (near large motors or relays), 
  * you can increase DEBOUNCE_SAMPLE_MS to 10ms. This extends the window to 80ms, 
  * providing a "tank-like" immunity to electrical noise at the cost of a tiny, 
  * barely-perceptible delay. */
-
+#define DEBOUNCE_SAMPLE_MS    5    
 /*
  * Mask that selects which bits of the 8-sample history we care about.
  *   0b11000111  →  oldest 2 bits + newest 3 bits
  * The 3 middle bits are "don't-care" (bounce zone).
  */
-#define DEBOUNCE_MASK         0xC7 /* 0b11000111 */
+#define DEBOUNCE_MASK         0xC7 // 0b11000111 
 
 /* -----------------------------------------------------------------------
  * Types
