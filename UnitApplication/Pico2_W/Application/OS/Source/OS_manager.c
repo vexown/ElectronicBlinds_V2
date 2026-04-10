@@ -72,6 +72,9 @@
 /* Misc includes */
 #include "Common.h"
 
+/* Blinds includes */
+#include "blinds_controller.h"
+
 /*******************************************************************************/
 /*                                 MACROS                                      */
 /*******************************************************************************/
@@ -80,6 +83,7 @@
 #define CYW43_INIT_TASK_PRIORITY        	(configMAX_PRIORITIES - 1)  // Highest
 #define ALIVE_TASK_PRIORITY             	(tskIDLE_PRIORITY + 1) 		// Lowest (but still higher than the idle task)
 #define MONITOR_TASK_PRIORITY				(tskIDLE_PRIORITY + 2)
+#define BLINDS_TASK_PRIORITY				(tskIDLE_PRIORITY + 2)
 #define NETWORK_TASK_PRIORITY 				(tskIDLE_PRIORITY + 3)
 
 /* Context for time-related macros, we use these two main helper macros from FreeRTOS (configTICK_RATE_HZ is defined in FreeRTOSConfig.h)
@@ -90,6 +94,7 @@
 #define ALIVE_TASK_PERIOD_TICKS			    pdMS_TO_TICKS(500)  //500ms
 #define NETWORK_TASK_PERIOD_TICKS			pdMS_TO_TICKS(200)  //200ms
 #define MONITOR_TASK_PERIOD_TICKS			pdMS_TO_TICKS(11000) //11s
+#define BLINDS_TASK_PERIOD_TICKS			pdMS_TO_TICKS(BLINDS_TASK_PERIOD_MS)
 
 /* Stack sizes - This parameter is in WORDS (on Pico W: 1 word = 32bit = 4bytes) */ 
 #define STACK_1024_BYTES					(configSTACK_DEPTH_TYPE)(256) 
@@ -117,6 +122,7 @@ static void aliveTask(__unused void *taskParams);
 static void cyw43initTask(__unused void *taskParams);
 static void networkTask(__unused void *taskParams);
 static void monitorTask(__unused void *taskParams);
+static void blindsTask(__unused void *taskParams);
 
 /*******************************************************************************/
 /*                             STATIC VARIABLES                                */
@@ -221,6 +227,7 @@ void OS_start( void )
 	taskCreationStatus[1] = xTaskCreate( networkTask, "Network", STACK_8192_BYTES, NULL, NETWORK_TASK_PRIORITY, NULL);
 	taskCreationStatus[2] = xTaskCreate( monitorTask, "Monitor", STACK_2048_BYTES, NULL, MONITOR_TASK_PRIORITY, &monitorTaskHandle);
 	taskCreationStatus[3] = xTaskCreate( cyw43initTask, "CYW43_Init", STACK_1024_BYTES, NULL, CYW43_INIT_TASK_PRIORITY, NULL); // Must be highest priority, will be deleted after it runs
+	taskCreationStatus[4] = xTaskCreate( blindsTask, "Blinds", STACK_2048_BYTES, NULL, BLINDS_TASK_PRIORITY, NULL);
 
 #if (WATCHDOG_ENABLED == ON)
     /*  Enable the watchdog timer: 
@@ -516,14 +523,14 @@ static void aliveTask(__unused void *taskParams)
 	}
 }
 
-/* 
+/*
  * Function: cyw43initTask
- * 
+ *
  * Description: Task initializing the CYW43 wireless chip. Must be run first (set to highest priority).
- * 
+ *
  * Parameters:
  *   - taskParams (not used)
- * 
+ *
  * Returns: void
  */
 static void cyw43initTask(__unused void *taskParams)
@@ -541,5 +548,45 @@ static void cyw43initTask(__unused void *taskParams)
 
 	/* Delete the task after it runs */
 	vTaskDelete(NULL);
+}
+
+/*
+ * Function: blindsTask
+ *
+ * Description: Periodic task that manages the window blind controller.
+ *              Initialises all peripherals (H-bridge, debouncer, DS3231 RTC)
+ *              then runs the blinds state machine every BLINDS_TASK_PERIOD_MS.
+ *
+ * Parameters:
+ *   - taskParams (not used)
+ *
+ * Returns: void (infinite loop)
+ */
+static void blindsTask(__unused void *taskParams)
+{
+	/*******************************************************************************/
+	/*                          Task Initialization Code                           */
+	/*******************************************************************************/
+	TickType_t xLastWakeTime;
+
+	Blinds_Status status = Blinds_Init();
+	if (status != BLINDS_OK)
+	{
+		LOG("Blinds init failed (status=%d). Task halted.\n", (int)status);
+		vTaskDelete(NULL);
+		return;
+	}
+
+	/* Initialize xLastWakeTime - this only needs to be done once. */
+	xLastWakeTime = xTaskGetTickCount();
+
+	/*******************************************************************************/
+	/*                               Task Loop Code                                */
+	/*******************************************************************************/
+	for( ;; )
+	{
+		vTaskDelayUntil(&xLastWakeTime, BLINDS_TASK_PERIOD_TICKS);
+		Blinds_MainFunction();
+	}
 }
 
