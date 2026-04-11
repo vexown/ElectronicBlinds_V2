@@ -92,6 +92,15 @@ static uint8_t              s_rtc_poll_count   = 0U;
  * reverts to AUTO. */
 static uint32_t             s_manual_idle_count = 0U;
 
+/* Auto-schedule state.
+ * s_auto_target_reached: set when the blinds arrive at the auto target for
+ *   the current period (top during daytime, bottom during nighttime). Cleared
+ *   when the period transitions so the next target triggers a fresh movement.
+ * s_auto_last_daytime: tracks which period was active when the last auto
+ *   movement completed, used to detect the transition. */
+static bool                 s_auto_target_reached = false;
+static bool                 s_auto_last_daytime   = false;
+
 /*******************************************************************************/
 /*                          GLOBAL FUNCTION DEFINITIONS                        */
 /*******************************************************************************/
@@ -155,6 +164,11 @@ Blinds_Status Blinds_Init(void)
         s_current_hour = dt.hours;
     }
 
+    /* Seed the period tracker so the first boot triggers one auto movement
+     * to bring the blinds to the correct position for the current period. */
+    s_auto_last_daytime   = !is_daytime(s_current_hour); /* force mismatch */
+    s_auto_target_reached = false;
+
     LOG("[Blinds] Initialized. Mode: AUTO. Current hour: %u.\n", s_current_hour);
     return BLINDS_OK;
 }
@@ -190,7 +204,9 @@ static void handle_limit_switches(bool at_top, bool at_bottom)
         motor_stop();
         s_state = BLINDS_STATE_IDLE;
         s_mode  = BLINDS_MODE_AUTO; /* Position is known — safe to hand back to auto. */
-        s_manual_idle_count = 0U;
+        s_manual_idle_count   = 0U;
+        s_auto_target_reached = true;  /* Don't raise again until day/night flips. */
+        s_auto_last_daytime   = is_daytime(s_current_hour);
         LOG("[Blinds] TOP limit reached. Motor stopped.\n");
     }
     else if (s_state == BLINDS_STATE_MOVING_DOWN && at_bottom)
@@ -198,7 +214,9 @@ static void handle_limit_switches(bool at_top, bool at_bottom)
         motor_stop();
         s_state = BLINDS_STATE_IDLE;
         s_mode  = BLINDS_MODE_AUTO;
-        s_manual_idle_count = 0U;
+        s_manual_idle_count   = 0U;
+        s_auto_target_reached = true;  /* Don't lower again until day/night flips. */
+        s_auto_last_daytime   = is_daytime(s_current_hour);
         LOG("[Blinds] BOTTOM limit reached. Motor stopped.\n");
     }
 }
@@ -227,10 +245,13 @@ static void handle_manual_buttons(bool at_top, bool at_bottom)
     /* --- UP button pressed ------------------------------------------------- */
     if (up_pressed && !at_top)
     {
-        /* Stop any ongoing downward movement before reversing. */
-        if (s_state == BLINDS_STATE_MOVING_DOWN)
+        /* Stop any ongoing movement before changing direction. If auto was in
+         * progress, mark its target as reached so it won't restart after the
+         * manual timeout. */
+        if (s_state != BLINDS_STATE_IDLE)
         {
             motor_stop();
+            s_auto_target_reached = true;
         }
         s_mode  = BLINDS_MODE_MANUAL;
         s_state = BLINDS_STATE_MOVING_UP;
@@ -241,9 +262,10 @@ static void handle_manual_buttons(bool at_top, bool at_bottom)
     /* --- DOWN button pressed ----------------------------------------------- */
     if (down_pressed && !at_bottom)
     {
-        if (s_state == BLINDS_STATE_MOVING_UP)
+        if (s_state != BLINDS_STATE_IDLE)
         {
             motor_stop();
+            s_auto_target_reached = true;
         }
         s_mode  = BLINDS_MODE_MANUAL;
         s_state = BLINDS_STATE_MOVING_DOWN;
@@ -308,17 +330,35 @@ static void handle_auto_control(bool at_top, bool at_bottom)
     if (s_mode != BLINDS_MODE_AUTO) return;
     if (s_state != BLINDS_STATE_IDLE)  return;
 
-    if (is_daytime(s_current_hour) && !at_top)
+    bool daytime = is_daytime(s_current_hour);
+
+    /* Detect a day/night transition and allow one new auto movement. */
+    if (daytime != s_auto_last_daytime)
+    {
+        s_auto_last_daytime   = daytime;
+        s_auto_target_reached = false;
+        LOG("[Blinds] Auto: schedule period changed. daytime=%d.\n", (int)daytime);
+    }
+
+    /* Already at the target for the current period — nothing to do. */
+    if (s_auto_target_reached) return;
+
+    if (daytime && !at_top)
     {
         motor_start_up();
         s_state = BLINDS_STATE_MOVING_UP;
         LOG("[Blinds] Auto: raising blinds (hour=%u).\n", s_current_hour);
     }
-    else if (!is_daytime(s_current_hour) && !at_bottom)
+    else if (!daytime && !at_bottom)
     {
         motor_start_down();
         s_state = BLINDS_STATE_MOVING_DOWN;
         LOG("[Blinds] Auto: lowering blinds (hour=%u).\n", s_current_hour);
+    }
+    else
+    {
+        /* Already at the correct limit on first check — nothing to do. */
+        s_auto_target_reached = true;
     }
 }
 
