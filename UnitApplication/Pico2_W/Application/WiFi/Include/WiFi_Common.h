@@ -30,6 +30,7 @@
 #define PICO_TRANSITION_TO_LISTEN_MODE  3
 #define PICO_TOGGLE_MONITORING_STATE    4
 #define PICO_TRANSITION_TO_UPDATE_MODE  5
+#define PICO_SHOW_FW_VERSION            6
 
 /*******************************************************************************/
 /*                               DATA TYPES                                   */

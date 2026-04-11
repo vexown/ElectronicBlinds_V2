@@ -134,7 +134,8 @@ static void WiFi_ProcessCommand(uint8_t command)
                 "  cmd:2 - Transition to Active Mode\n"
                 "  cmd:3 - Transition to Listen Mode\n"
                 "  cmd:4 - Toggle Monitoring State\n"
-                "  cmd:5 - Transition to Update Mode (OTA)\n";
+                "  cmd:5 - Transition to Update Mode (OTA)\n"
+                "  cmd:6 - Show Firmware Version\n";
             (void)tcp_send(help_msg, (uint16_t)strlen(help_msg));
             break;
         }
@@ -154,6 +155,17 @@ static void WiFi_ProcessCommand(uint8_t command)
             LOG("Transitioning to Update Mode...\n");
             WiFiState = UPDATE;
             break;
+        case PICO_SHOW_FW_VERSION:
+        {
+            LOG("Show firmware version command received\n");
+            uint8_t active_bank = check_active_bank();
+            uint32_t fw_version = check_current_fw_version();
+            char fw_info[64];
+            const char *bank_str = (active_bank == BANK_A) ? "A" : (active_bank == BANK_B) ? "B" : "Unknown";
+            snprintf(fw_info, sizeof(fw_info), "FW Version: %lu, Active Bank: %s\n", (unsigned long)fw_version, bank_str);
+            (void)tcp_send(fw_info, (uint16_t)strlen(fw_info));
+            break;
+        }
         default:
             LOG("Command not supported \n");
             break;
