@@ -94,7 +94,11 @@ function(create_moduri_target target_name linker_script)
     target_link_libraries(${target_name} PRIVATE flash_utils)
 
     # Set compile definitions if needed
-    target_compile_definitions(${target_name} PRIVATE)
+    # GP0 is damaged on my dev board, remap UART0 to GP12 (TX) / GP13 (RX)
+    target_compile_definitions(${target_name} PRIVATE
+        PICO_DEFAULT_UART_TX_PIN=12
+        PICO_DEFAULT_UART_RX_PIN=13
+    )
 
     # Set include directories
     target_include_directories(${target_name} PRIVATE
@@ -141,6 +145,10 @@ function(create_moduri_target target_name linker_script)
 
     # Add extra outputs specific to the Pico SDK
     pico_add_extra_outputs(${target_name})
+
+    # Route printf/LOG output to UART0 (GP0 TX, GP1 RX), disable USB CDC
+    pico_enable_stdio_uart(${target_name} 1)
+    pico_enable_stdio_usb(${target_name} 0)
 endfunction()
 
 # Create two targets: one for Bank A and one for Bank B
