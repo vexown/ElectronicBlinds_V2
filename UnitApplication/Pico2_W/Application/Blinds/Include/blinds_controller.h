@@ -91,7 +91,7 @@
 /*******************************************************************************/
 
 /** @brief PWM duty-cycle magnitude, 0–255. Adjust for your motor's load. */
-#define BLINDS_MOTOR_SPEED          200U
+#define BLINDS_MOTOR_SPEED          125U
 
 /**
  * @brief H-bridge direction that physically raises the blinds.
