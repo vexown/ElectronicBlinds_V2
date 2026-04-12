@@ -10,10 +10,10 @@
  *
  * | Signal          | GPIO | Direction |
  * |-----------------|------|-----------|
- * | Button UP       | GP20 | Input, pull-up, active-low |
- * | Button DOWN     | GP21 | Input, pull-up, active-low |
- * | Limit switch A  | GP14 | Input, pull-up, active-low (top position)    |
- * | Limit switch B  | GP15 | Input, pull-up, active-low (bottom position) |
+ * | Button UP       | GP21 | Input, pull-up, active-low |
+ * | Button DOWN     | GP20 | Input, pull-up, active-low |
+ * | Limit switch A  | GP15 | Input, pull-up, active-low (top position)    |
+ * | Limit switch B  | GP14 | Input, pull-up, active-low (bottom position) |
  * | LPWM (forward)  | GP16 | PWM out (managed by h_bridge_controller)     |
  * | RPWM (reverse)  | GP17 | PWM out (managed by h_bridge_controller)     |
  * | L_EN            | GP18 | Digital out (managed by h_bridge_controller) |
@@ -64,17 +64,17 @@
 /*                                 PIN DEFINITIONS                             */
 /*******************************************************************************/
 
-/** @brief GP20 — Button UP, active-low, internal pull-up. */
-#define BLINDS_BTN_UP_PIN           20U
+/** @brief GP21 — Button UP, active-low, internal pull-up. */
+#define BLINDS_BTN_UP_PIN           21U
 
-/** @brief GP21 — Button DOWN, active-low, internal pull-up. */
-#define BLINDS_BTN_DOWN_PIN         21U
+/** @brief GP20 — Button DOWN, active-low, internal pull-up. */
+#define BLINDS_BTN_DOWN_PIN         20U
 
-/** @brief GP14 — Limit switch A (top position), active-low, internal pull-up. */
-#define BLINDS_LIMIT_TOP_PIN        14U
+/** @brief GP15 — Limit switch A (top position), active-low, internal pull-up. */
+#define BLINDS_LIMIT_TOP_PIN        15U
 
-/** @brief GP15 — Limit switch B (bottom position), active-low, internal pull-up. */
-#define BLINDS_LIMIT_BOTTOM_PIN     15U
+/** @brief GP14 — Limit switch B (bottom position), active-low, internal pull-up. */
+#define BLINDS_LIMIT_BOTTOM_PIN     14U
 
 /*******************************************************************************/
 /*                             AUTOMATIC SCHEDULE                              */
@@ -99,10 +99,10 @@
  * If the blinds move the wrong way, swap HBRIDGE_FORWARD / HBRIDGE_REVERSE
  * here rather than rewiring the motor.
  */
-#define BLINDS_MOTOR_DIR_UP         HBRIDGE_FORWARD
+#define BLINDS_MOTOR_DIR_UP         HBRIDGE_REVERSE
 
 /** @brief H-bridge direction that physically lowers the blinds. */
-#define BLINDS_MOTOR_DIR_DOWN       HBRIDGE_REVERSE
+#define BLINDS_MOTOR_DIR_DOWN       HBRIDGE_FORWARD
 
 /*******************************************************************************/
 /*                               TIMING CONSTANTS                              */
