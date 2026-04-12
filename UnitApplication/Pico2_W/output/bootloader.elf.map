@@ -1701,7 +1701,7 @@ Discarded input sections
  .text          0x00000000        0x0 ../Common/FlashUtils/libflash_utils.a(flash_operations.c.o)
  .data          0x00000000        0x0 ../Common/FlashUtils/libflash_utils.a(flash_operations.c.o)
  .bss           0x00000000        0x0 ../Common/FlashUtils/libflash_utils.a(flash_operations.c.o)
- .text.write_to_flash
+ .time_critical.write_to_flash
                 0x00000000       0x38 ../Common/FlashUtils/libflash_utils.a(flash_operations.c.o)
  .text.check_active_bank
                 0x00000000       0x22 ../Common/FlashUtils/libflash_utils.a(flash_operations.c.o)
