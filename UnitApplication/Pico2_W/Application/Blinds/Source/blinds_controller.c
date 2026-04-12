@@ -158,6 +158,8 @@ Blinds_Status Blinds_Init(void)
     }
 
     /* Prime the cached hour so the first auto decision uses real data. */
+    /* On 12.04.2026 when I set the RTC, it was 5 seconds behind https://time.is/ (Polish time)
+     * We'll see how this DS3231 drifts over time - I'm very curious! (TODO - check this in the future!) */
     DS3231_DateTime dt;
     if (DS3231_GetDateTime(&dt) == DS3231_OK)
     {
