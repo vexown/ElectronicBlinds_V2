@@ -81,10 +81,10 @@
 /*******************************************************************************/
 
 /** @brief Hour (0–23) at which the blinds are raised each day. */
-#define BLINDS_DAYTIME_START_HOUR   7U
+#define BLINDS_DAYTIME_START_HOUR   10U
 
 /** @brief Hour (0–23) at which the blinds are lowered each day. */
-#define BLINDS_NIGHTTIME_START_HOUR 19U
+#define BLINDS_NIGHTTIME_START_HOUR 17U
 
 /*******************************************************************************/
 /*                              MOTOR CONFIGURATION                            */
