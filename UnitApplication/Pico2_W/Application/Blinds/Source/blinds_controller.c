@@ -162,6 +162,13 @@ Blinds_Status Blinds_Init(void)
     if (DS3231_GetDateTime(&dt) == DS3231_OK)
     {
         s_current_hour = dt.hours;
+        LOG("[Blinds] RTC: 20%02u-%02u-%02u %02u:%02u:%02u\n",
+            dt.year, dt.month, dt.date,
+            dt.hours, dt.minutes, dt.seconds);
+    }
+    else
+    {
+        LOG("[Blinds] WARNING: RTC read failed at init. Using hour=0.\n");
     }
 
     /* Seed the period tracker so the first boot triggers one auto movement
