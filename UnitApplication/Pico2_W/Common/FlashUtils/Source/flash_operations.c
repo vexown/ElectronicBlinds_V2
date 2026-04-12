@@ -71,9 +71,18 @@ bool write_metadata_to_flash(const boot_metadata_t *ram_metadata)
     return true;
 }
 
-bool write_to_flash(uint32_t flash_offset, const uint8_t *data, size_t length) 
+bool __not_in_flash_func(write_to_flash)(uint32_t flash_offset, const uint8_t *data, size_t length)
 {
-    /* Save and disable interrupts during flash operations.
+    /* This function is placed in SRAM (via __not_in_flash_func) so that its instruction
+     * fetches never touch XIP while flash_range_erase/flash_range_program are running.
+     * The SDK's flash_range_erase and flash_range_program are already in .time_critical
+     * (SRAM); putting write_to_flash there as well means the entire critical path is
+     * RAM-resident. This was done to chase a deterministic OTA hang at Bank B sector
+     * 0x24c000 on the 3rd consecutive OTA, where the bank being erased shares low
+     * address bits with Bank A's copy of write_to_flash and could plausibly alias in
+     * the XIP cache during erase/cache-flush.
+     *
+     * Save and disable interrupts during flash operations.
      * This is important on the RP2350 because:
      * 1. Code executes directly from external flash via XIP (Execute In Place).
      *    During write or erase operations, XIP access is stalled, which can lead to faults or hangs.
