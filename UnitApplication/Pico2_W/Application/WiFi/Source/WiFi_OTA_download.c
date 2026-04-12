@@ -75,6 +75,15 @@ static bool http_headers_processed;
 /* Determines which bank we should download the new firmware to. We will always download to the inactive bank. */
 static uint8_t inactive_bank;
 
+/* Position in the HTTP header accumulation buffer. File-scope so download_firmware() can reset it
+ * between calls - the HTTP headers for a single response may span multiple TCP reads, so the parser
+ * needs to remember its position across decrypted chunks, but NOT across download attempts. */
+static size_t header_buf_pos;
+
+/* Number of reconnection attempts made during the current download. File-scope so download_firmware()
+ * can reset it between calls. */
+static int reconnect_attempts;
+
 /**********************************************************************/
 /*                  STATIC FUNCTION DECLARATIONS                      */
 /**********************************************************************/
@@ -200,9 +209,20 @@ int download_firmware(void)
 
     /* Flash variables */
     static uint8_t flash_buffer[CHUNK_SIZE];
-    
+
     /******************************* Initialization *******************************/
-    
+
+    /* Reset module-level state. These file-scope statics persist across calls;
+     * without resetting them, a second download_firmware() invocation in the same
+     * boot would inherit stale values (e.g. total_received == expected_size would
+     * immediately satisfy the "download complete" condition). */
+    expected_size = 0;
+    total_received = 0;
+    flash_buf_pos = 0;
+    http_headers_processed = false;
+    header_buf_pos = 0;
+    reconnect_attempts = 0;
+
     LOG("=== Starting firmware download ===\n");
     LOG("Target server: https://%s%s\n", OTA_HTTPS_SERVER_IP_ADDRESS, FIRMWARE_PATH);
 
@@ -586,8 +606,8 @@ static int process_http_response_headers(const uint8_t *pp_decrypted_data_buffer
      * It is a bit of a waste of memory, but we don't expect the headers to be very large. If needed we can change this process in the future. */
     static uint8_t http_header_buffer[HTTP_HEADER_MAX_SIZE];
 
-    /* Position in the buffer where we are currently writing the header data */
-    static size_t header_buf_pos = 0;
+    /* Note: header_buf_pos is now file-scope (see top of file) so that download_firmware()
+     * can reset it between invocations. */
 
     /* Length of the content based on the Content-Length header */
     size_t content_length = 0;
@@ -775,22 +795,35 @@ static int process_decrypted_data(const uint8_t *p_decrypted_data_buffer, int p_
 
                 num_of_firmware_bytes_left -= copy_size; // reduce the remaining bytes to process by the number of bytes copied
                 
-                /* We accumulate the decrypted firmware data in the flash buffer until it is full. If we have less than a full chunk, 
+                /* We accumulate the decrypted firmware data in the flash buffer until it is full. If we have less than a full chunk,
                  * we exit the loop on after processing all available firmware bytes and return to the main loop to read more data from the socket. */
-                if (flash_buf_pos == CHUNK_SIZE) 
+                if (flash_buf_pos == CHUNK_SIZE)
                 {
                     /* Determine the base offset based on the inactive bank */
                     uint32_t base_offset = (inactive_bank == BANK_A) ? APP_BANK_A_OFFSET : APP_BANK_B_OFFSET;
-                    
-                    /* Write the firmware data to the exact location where bootloader expects it (inactive bank) */
-                    uint32_t write_offset = base_offset + total_received;
-                    LOG("Writing %d bytes to flash (Bank %c) at offset 0x%lx\n", CHUNK_SIZE, (inactive_bank == BANK_A ? 'A' : 'B'), write_offset);
-                    if (!write_to_flash(write_offset, p_flash_buffer, CHUNK_SIZE)) 
+                    uint32_t chunk_base_offset = base_offset + total_received;
+
+                    LOG("Writing %d bytes to flash (Bank %c) at offset 0x%lx\n", CHUNK_SIZE, (inactive_bank == BANK_A ? 'A' : 'B'), chunk_base_offset);
+
+                    /* Sector-by-sector flush. write_to_flash() disables interrupts for the full erase+program
+                     * cycle. A 64 KB (16-sector) single call blocks interrupts for hundreds of milliseconds,
+                     * long enough for the CYW43 chip's internal RX buffer to overflow and the lwIP tcpip_task
+                     * to miss ACKs, which in turn kills the TLS stream mid-download. Flushing one sector at a
+                     * time, with a short vTaskDelay between sectors, keeps the maximum interrupt-off window
+                     * bounded (one sector erase+program ~20-50 ms) and gives the network stack a chance to
+                     * drain the RX buffer between bursts. */
+                    for (size_t sector_offset_in_buf = 0; sector_offset_in_buf < CHUNK_SIZE; sector_offset_in_buf += FLASH_SECTOR_SIZE)
                     {
-                        LOG("Flash write failed\n");
-                        return -1;
+                        uint32_t sector_write_offset = chunk_base_offset + sector_offset_in_buf;
+                        if (!write_to_flash(sector_write_offset, p_flash_buffer + sector_offset_in_buf, FLASH_SECTOR_SIZE))
+                        {
+                            LOG("Flash write failed at sector offset 0x%lx\n", sector_write_offset);
+                            return -1;
+                        }
+                        /* Yield so tcpip_task can ACK and CYW43 can drain its RX buffer. */
+                        vTaskDelay(pdMS_TO_TICKS(2));
                     }
-                    
+
                     total_received += CHUNK_SIZE; // Only now update the total received bytes (in flash == received)
                     flash_buf_pos = 0; // Since we flushed the flash buffer, reset it for the next chunk
                 }
@@ -895,7 +928,8 @@ static int process_decrypted_data(const uint8_t *p_decrypted_data_buffer, int p_
 
 static int attempt_reconnect(mbedtls_ssl_context *p_ssl_context, char *http_request)
 {
-    static int reconnect_attempts = 0;
+    /* Note: reconnect_attempts is now file-scope (see top of file) so that download_firmware()
+     * can reset it between invocations. */
 
     reconnect_attempts++;
     LOG("Connection reset, attempting to reconnect (%d/%d)...\n", reconnect_attempts, RECONNECT_MAX_ATTEMPTS);
@@ -990,23 +1024,41 @@ static int attempt_reconnect(mbedtls_ssl_context *p_ssl_context, char *http_requ
 
 static int write_last_chunk_to_flash(uint8_t *p_flash_buffer, size_t p_flash_buf_pos)
 {
-    if (p_flash_buf_pos > 0) 
+    if (p_flash_buf_pos > 0)
     {
         /* Determine the base offset based on the inactive bank */
         uint32_t base_offset = (inactive_bank == BANK_A) ? APP_BANK_A_OFFSET : APP_BANK_B_OFFSET;
-        
+
         /* Write the firmware data to the exact location where bootloader expects it (inactive bank) */
-        uint32_t write_offset = base_offset + total_received;
-        LOG("Writing final %zu bytes to flash (Bank %c) at offset 0x%lx\n", p_flash_buf_pos, (inactive_bank == BANK_A ? 'A' : 'B'), write_offset);
-        if (!write_to_flash(write_offset, p_flash_buffer, p_flash_buf_pos)) 
+        uint32_t chunk_base_offset = base_offset + total_received;
+        LOG("Writing final %zu bytes to flash (Bank %c) at offset 0x%lx\n", p_flash_buf_pos, (inactive_bank == BANK_A ? 'A' : 'B'), chunk_base_offset);
+
+        /* Sector-by-sector flush, matching the main process_decrypted_data() loop. See the rationale
+         * comment there: a single large write_to_flash() would disable interrupts too long and starve
+         * the CYW43/lwIP path. The final chunk is < CHUNK_SIZE and typically not sector-aligned at the
+         * tail, so the last iteration writes the remaining partial sector in one shot - write_to_flash()
+         * already rounds the erase up to a full sector internally. */
+        size_t bytes_flushed = 0;
+        while (bytes_flushed < p_flash_buf_pos)
         {
-            LOG("Final flash write failed\n");
-            return -1; // Indicate failure
+            size_t bytes_left = p_flash_buf_pos - bytes_flushed;
+            size_t this_write = (bytes_left >= FLASH_SECTOR_SIZE) ? FLASH_SECTOR_SIZE : bytes_left;
+            uint32_t sector_write_offset = chunk_base_offset + bytes_flushed;
+            if (!write_to_flash(sector_write_offset, p_flash_buffer + bytes_flushed, this_write))
+            {
+                LOG("Final flash write failed at sector offset 0x%lx\n", sector_write_offset);
+                return -1; // Indicate failure
+            }
+            bytes_flushed += this_write;
+            /* Yield so tcpip_task can run between sectors. Not strictly required for the final flush
+             * (the stream is done), but keeps behavior consistent and avoids starving the network
+             * stack during cleanup. */
+            vTaskDelay(pdMS_TO_TICKS(2));
         }
-        
+
         total_received += p_flash_buf_pos; // update the total received bytes one final time (it should be equal to expected_size now)
     }
-    
+
     return 0; // Indicate success
 }
 

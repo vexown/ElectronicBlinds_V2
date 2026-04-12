@@ -349,18 +349,26 @@ int tcp_receive_mbedtls_callback(void *shared_context, unsigned char *buf, size_
     {
         LOG("No data available in the TCP receive buffer. Waiting for data...\n");
 
-        /* Wait for data notification for up to 5 seconds. Check if the semaphore is available every 100 ms. In the
-        meantime, allow other tasks to run. If after 5 seconds no data is available, return a timeout error. */
+        /* Wait for data notification for up to 5 seconds. We loop on the actual condition
+         * (receive_length > 0) rather than on the semaphore take succeeding: tcp_data_available_semaphore
+         * is binary and can be left "given" by a previous recv even after the drain code in
+         * tcp_client_process_recv_message has already consumed the data. In that case xSemaphoreTake
+         * returns pdTRUE immediately but clientGlobal->receive_length is still 0, and then
+         * tcp_receive_data() below returns zero bytes -> we incorrectly emitted "No data received"
+         * and returned MBEDTLS_ERR_SSL_WANT_READ, which in turn could cascade into read timeouts
+         * right after a large TLS record had just been fully consumed. Looping on the actual state
+         * makes the wait correct even if the semaphore and receive_length get out of sync. */
         TickType_t start_time = xTaskGetTickCount();
-        while (xSemaphoreTake(tcp_data_available_semaphore, pdMS_TO_TICKS(100)) != pdTRUE)
+        while (clientGlobal->receive_length == 0)
         {
+            (void)xSemaphoreTake(tcp_data_available_semaphore, pdMS_TO_TICKS(100));
             if ((xTaskGetTickCount() - start_time) > pdMS_TO_TICKS(5000)) // Wait for new data for max 5 seconds
             {
                 LOG("Timeout waiting for data\n");
                 return MBEDTLS_ERR_SSL_TIMEOUT;
             }
         }
-        LOG("Data available in the TCP receive buffer\n");
+        LOG("Data available in the TCP receive buffer: %d bytes\n", clientGlobal->receive_length);
 
         /* Double check if the connection is still alive */
         if(tcp_client_is_connected() == false)
@@ -1557,16 +1565,37 @@ static err_t tcp_client_recv_callback(void *arg, struct tcp_pcb *tpcb, struct pb
                     * Disadvantages: Binary on/off control rather than gradual slowdown
                     */
                 } 
-                else 
+                else if (clientGlobal->flow_throttled)
                 {
-                    /* Buffer has space - normal flow */
-                    if (clientGlobal->flow_throttled) {
-                        LOG("Resuming normal flow, buffer: %d/%d bytes\n", 
-                            clientGlobal->receive_length, TCP_RECV_BUFFER_SIZE);
-                        clientGlobal->flow_throttled = false;
-                    }
-                    /* Inform lwIP that the received data of size rcv_data->tot_len has been processed */
-                    tcp_recved(tpcb, received_data_size);  // Normal acknowledgment
+                    /* We're still throttled but some data arrived anyway - typically the tail of an
+                     * in-flight segment that was already on the wire when we closed the window, or a
+                     * zero-window probe response. Do NOT clear flow_throttled and do NOT call tcp_recved()
+                     * here:
+                     *
+                     *   1. Hysteresis: the resume threshold is "buffer below half the throttle threshold",
+                     *      checked by the drain side in tcp_client_process_recv_message(). Clearing the
+                     *      flag here on the high-water threshold bypasses hysteresis and causes rapid
+                     *      throttle/unthrottle oscillation.
+                     *
+                     *   2. Window management: the drain-side recovery is the only place that correctly
+                     *      re-opens the window with TCP_RECV_BUFFER_SIZE - receive_length (a full reset
+                     *      to current available space). That code is guarded on flow_throttled == true,
+                     *      so clearing the flag here disables it and the window stays permanently small.
+                     *
+                     *   3. Observed failure: during the intermittent OTA failure, a flash write began
+                     *      while flow_throttled had been prematurely cleared by this path, which left
+                     *      the server free to transmit during the interrupt-off window and overflowed
+                     *      the CYW43 RX buffer.
+                     *
+                     * Leaving flow_throttled = true and skipping tcp_recved keeps the zero window closed
+                     * until the drain side has enough headroom to reopen it. */
+                    LOG("Throttled - holding back ACK for %d bytes (buf %d/%d)\n",
+                        received_data_size, clientGlobal->receive_length, TCP_RECV_BUFFER_SIZE);
+                }
+                else
+                {
+                    /* Not throttled and buffer has space - normal acknowledgment. */
+                    tcp_recved(tpcb, received_data_size);
                 }
 
             } 
