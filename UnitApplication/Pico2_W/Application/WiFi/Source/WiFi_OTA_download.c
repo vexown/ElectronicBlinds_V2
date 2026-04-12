@@ -815,11 +815,15 @@ static int process_decrypted_data(const uint8_t *p_decrypted_data_buffer, int p_
                     for (size_t sector_offset_in_buf = 0; sector_offset_in_buf < CHUNK_SIZE; sector_offset_in_buf += FLASH_SECTOR_SIZE)
                     {
                         uint32_t sector_write_offset = chunk_base_offset + sector_offset_in_buf;
+                        LOG("  Sector %2zu/16: erasing+programming 0x%lx\n",
+                            (sector_offset_in_buf / FLASH_SECTOR_SIZE) + 1u,
+                            sector_write_offset);
                         if (!write_to_flash(sector_write_offset, p_flash_buffer + sector_offset_in_buf, FLASH_SECTOR_SIZE))
                         {
                             LOG("Flash write failed at sector offset 0x%lx\n", sector_write_offset);
                             return -1;
                         }
+                        LOG("  Sector done: 0x%lx\n", sector_write_offset);
                         /* Yield so tcpip_task can ACK and CYW43 can drain its RX buffer. */
                         vTaskDelay(pdMS_TO_TICKS(2));
                     }
@@ -1044,11 +1048,13 @@ static int write_last_chunk_to_flash(uint8_t *p_flash_buffer, size_t p_flash_buf
             size_t bytes_left = p_flash_buf_pos - bytes_flushed;
             size_t this_write = (bytes_left >= FLASH_SECTOR_SIZE) ? FLASH_SECTOR_SIZE : bytes_left;
             uint32_t sector_write_offset = chunk_base_offset + bytes_flushed;
+            LOG("  Final sector: erasing+programming 0x%lx (%zu bytes)\n", sector_write_offset, this_write);
             if (!write_to_flash(sector_write_offset, p_flash_buffer + bytes_flushed, this_write))
             {
                 LOG("Final flash write failed at sector offset 0x%lx\n", sector_write_offset);
                 return -1; // Indicate failure
             }
+            LOG("  Final sector done: 0x%lx\n", sector_write_offset);
             bytes_flushed += this_write;
             /* Yield so tcpip_task can run between sectors. Not strictly required for the final flush
              * (the stream is done), but keeps behavior consistent and avoids starving the network
