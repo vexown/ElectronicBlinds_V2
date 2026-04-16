@@ -21,11 +21,13 @@
  *     activity.
  *
  * Auto mode:
- *   - Between BLINDS_DAYTIME_START_HOUR and BLINDS_NIGHTTIME_START_HOUR:
+ *   - Between local sunrise and (local sunset + BLINDS_SUNSET_OFFSET_HOURS):
  *     motor runs UP until the top limit switch fires.
  *   - Outside that window: motor runs DOWN until the bottom limit switch fires.
  *   - Once at the correct limit, the motor stays idle until the schedule
  *     transitions.
+ *   - Sunrise/sunset are recomputed from the DS3231 date whenever the date
+ *     rolls over; DST is applied automatically (EU rules).
  */
 
 /*******************************************************************************/
@@ -36,6 +38,7 @@
 #include "button_debouncer.h"
 #include "h_bridge_controller.h"
 #include "DS3231_HAL.h"
+#include "time_calculations.h"
 #include "Common.h"
 
 /*******************************************************************************/
@@ -70,7 +73,9 @@ typedef enum
 static void         motor_stop(void);
 static void         motor_start_up(void);
 static void         motor_start_down(void);
-static bool         is_daytime(uint8_t hour);
+static bool         is_daytime(float time_of_day_h);
+static float        rtc_decimal_hours(const DS3231_DateTime *dt);
+static void         recalculate_sun_schedule(const DS3231_DateTime *dt);
 static void         handle_limit_switches(bool at_top, bool at_bottom);
 static void         handle_manual_buttons(bool at_top, bool at_bottom);
 static void         handle_auto_control(bool at_top, bool at_bottom);
@@ -83,9 +88,18 @@ static void         poll_rtc(void);
 static Blinds_InternalState s_state            = BLINDS_STATE_IDLE;
 static Blinds_Mode          s_mode             = BLINDS_MODE_AUTO;
 
-/* Cached RTC hour — updated every BLINDS_RTC_POLL_CALLS task calls. */
-static uint8_t              s_current_hour     = 0U;
+/* Cached RTC snapshot — refreshed every BLINDS_RTC_POLL_CALLS task calls. */
+static DS3231_DateTime      s_rtc_snapshot     = {0};
 static uint8_t              s_rtc_poll_count   = 0U;
+
+/* Cached sun-schedule for the current calendar day (decimal hours, local time).
+ * s_sunset_cutoff_hours already includes BLINDS_SUNSET_OFFSET_HOURS. The date
+ * for which they were computed is tracked so poll_rtc() can detect a rollover
+ * and recompute. s_schedule_date == 0 means "not yet computed". */
+static float                s_sunrise_hours       = 0.0f;
+static float                s_sunset_cutoff_hours = 0.0f;
+static uint8_t              s_schedule_date       = 0U;
+static uint8_t              s_schedule_month      = 0U;
 
 /* Manual mode inactivity counter. Counts task calls since the last button
  * press/release event. When it reaches MANUAL_TIMEOUT_CALLS the controller
@@ -157,28 +171,30 @@ Blinds_Status Blinds_Init(void)
         return BLINDS_ERROR_RTC_INIT;
     }
 
-    /* Prime the cached hour so the first auto decision uses real data. */
+    /* Prime the cached snapshot and sun-schedule so the first auto decision
+     * uses real data. */
     /* On 13.04.2026 when I set the RTC, it was exactly synced with https://time.is/ (Polish time)
      * We'll see how this DS3231 drifts over time - I'm very curious! (TODO - check this in the future!) */
     DS3231_DateTime dt;
     if (DS3231_GetDateTime(&dt) == DS3231_OK)
     {
-        s_current_hour = dt.hours;
+        s_rtc_snapshot = dt;
+        recalculate_sun_schedule(&dt);
         LOG("[Blinds] RTC: 20%02u-%02u-%02u %02u:%02u:%02u\n",
             dt.year, dt.month, dt.date,
             dt.hours, dt.minutes, dt.seconds);
     }
     else
     {
-        LOG("[Blinds] WARNING: RTC read failed at init. Using hour=0.\n");
+        LOG("[Blinds] WARNING: RTC read failed at init. Auto schedule unset.\n");
     }
 
     /* Seed the period tracker so the first boot triggers one auto movement
      * to bring the blinds to the correct position for the current period. */
-    s_auto_last_daytime   = !is_daytime(s_current_hour); /* force mismatch */
+    s_auto_last_daytime   = !is_daytime(rtc_decimal_hours(&s_rtc_snapshot)); /* force mismatch */
     s_auto_target_reached = false;
 
-    LOG("[Blinds] Initialized. Mode: AUTO. Current hour: %u.\n", s_current_hour);
+    LOG("[Blinds] Initialized. Mode: AUTO.\n");
     return BLINDS_OK;
 }
 
@@ -208,6 +224,8 @@ void Blinds_MainFunction(void)
  */
 static void handle_limit_switches(bool at_top, bool at_bottom)
 {
+    float now_h = rtc_decimal_hours(&s_rtc_snapshot);
+
     if (s_state == BLINDS_STATE_MOVING_UP && at_top)
     {
         motor_stop();
@@ -215,7 +233,7 @@ static void handle_limit_switches(bool at_top, bool at_bottom)
         s_mode  = BLINDS_MODE_AUTO; /* Position is known — safe to hand back to auto. */
         s_manual_idle_count   = 0U;
         s_auto_target_reached = true;  /* Don't raise again until day/night flips. */
-        s_auto_last_daytime   = is_daytime(s_current_hour);
+        s_auto_last_daytime   = is_daytime(now_h);
         LOG("[Blinds] TOP limit reached. Motor stopped.\n");
     }
     else if (s_state == BLINDS_STATE_MOVING_DOWN && at_bottom)
@@ -225,7 +243,7 @@ static void handle_limit_switches(bool at_top, bool at_bottom)
         s_mode  = BLINDS_MODE_AUTO;
         s_manual_idle_count   = 0U;
         s_auto_target_reached = true;  /* Don't lower again until day/night flips. */
-        s_auto_last_daytime   = is_daytime(s_current_hour);
+        s_auto_last_daytime   = is_daytime(now_h);
         LOG("[Blinds] BOTTOM limit reached. Motor stopped.\n");
     }
 }
@@ -307,7 +325,9 @@ static void handle_manual_buttons(bool at_top, bool at_bottom)
 }
 
 /**
- * @brief Periodically read the DS3231 RTC and cache the current hour.
+ * @brief Periodically read the DS3231 RTC and refresh the cached snapshot.
+ *        Recomputes the sunrise/sunset schedule whenever the calendar date
+ *        changes (so the rollover that matters happens at local midnight).
  */
 static void poll_rtc(void)
 {
@@ -318,7 +338,11 @@ static void poll_rtc(void)
         DS3231_DateTime dt;
         if (DS3231_GetDateTime(&dt) == DS3231_OK)
         {
-            s_current_hour = dt.hours;
+            s_rtc_snapshot = dt;
+            if (dt.date != s_schedule_date || dt.month != s_schedule_month)
+            {
+                recalculate_sun_schedule(&dt);
+            }
         }
         else
         {
@@ -339,7 +363,8 @@ static void handle_auto_control(bool at_top, bool at_bottom)
     if (s_mode != BLINDS_MODE_AUTO) return;
     if (s_state != BLINDS_STATE_IDLE)  return;
 
-    bool daytime = is_daytime(s_current_hour);
+    float now_h  = rtc_decimal_hours(&s_rtc_snapshot);
+    bool  daytime = is_daytime(now_h);
 
     /* Detect a day/night transition and allow one new auto movement. */
     if (daytime != s_auto_last_daytime)
@@ -356,13 +381,15 @@ static void handle_auto_control(bool at_top, bool at_bottom)
     {
         motor_start_up();
         s_state = BLINDS_STATE_MOVING_UP;
-        LOG("[Blinds] Auto: raising blinds (hour=%u).\n", s_current_hour);
+        LOG("[Blinds] Auto: raising blinds (%02u:%02u).\n",
+            s_rtc_snapshot.hours, s_rtc_snapshot.minutes);
     }
     else if (!daytime && !at_bottom)
     {
         motor_start_down();
         s_state = BLINDS_STATE_MOVING_DOWN;
-        LOG("[Blinds] Auto: lowering blinds (hour=%u).\n", s_current_hour);
+        LOG("[Blinds] Auto: lowering blinds (%02u:%02u).\n",
+            s_rtc_snapshot.hours, s_rtc_snapshot.minutes);
     }
     else
     {
@@ -389,11 +416,57 @@ static void motor_start_down(void)
 }
 
 /**
- * @brief Return true during the configured daytime window.
- * @param hour  Current hour in 24 h format (0–23).
+ * @brief Return true when the given local time-of-day falls between sunrise
+ *        and (sunset + BLINDS_SUNSET_OFFSET_HOURS).
+ * @param time_of_day_h  Local time of day as decimal hours (0.0–24.0).
  */
-static bool is_daytime(uint8_t hour)
+static bool is_daytime(float time_of_day_h)
 {
-    return (hour >= BLINDS_DAYTIME_START_HOUR) &&
-           (hour <  BLINDS_NIGHTTIME_START_HOUR);
+    return (time_of_day_h >= s_sunrise_hours) &&
+           (time_of_day_h <  s_sunset_cutoff_hours);
+}
+
+/**
+ * @brief Convert a DS3231 snapshot to local time-of-day in decimal hours.
+ */
+static float rtc_decimal_hours(const DS3231_DateTime *dt)
+{
+    return (float)dt->hours
+         + (float)dt->minutes / 60.0f
+         + (float)dt->seconds / 3600.0f;
+}
+
+/**
+ * @brief Recompute cached sunrise / (sunset + offset) for the given date.
+ *
+ * The NOAA helpers in time_calculations.c expect BCD inputs, while the DS3231
+ * HAL exposes plain decimal fields, so each field is converted here before
+ * the call.
+ */
+static void recalculate_sun_schedule(const DS3231_DateTime *dt)
+{
+    uint32_t year_bcd  = (uint32_t)ConvertBCD((uint16_t)dt->year,  DEC_TO_BCD);
+    uint32_t month_bcd = (uint32_t)ConvertBCD((uint16_t)dt->month, DEC_TO_BCD);
+    uint32_t date_bcd  = (uint32_t)ConvertBCD((uint16_t)dt->date,  DEC_TO_BCD);
+
+    int  day_of_year = (int)CalculateDayOfYear(year_bcd, month_bcd, date_bcd);
+    bool dst_active  = isDST(year_bcd, month_bcd, date_bcd);
+    int  timezone    = TIME_ZONE_PLUS_TO_E + (dst_active ? 1 : 0);
+
+    float sunrise_h = 0.0f;
+    float sunset_h  = 0.0f;
+    CalculateSunriseSunset((float)LATITUDE_SIEROSZEWICE, (float)LONGITUDE_SIEROSZEWICE,
+                           day_of_year, timezone, &sunrise_h, &sunset_h);
+
+    s_sunrise_hours       = sunrise_h;
+    s_sunset_cutoff_hours = sunset_h + BLINDS_SUNSET_OFFSET_HOURS;
+    s_schedule_date       = dt->date;
+    s_schedule_month      = dt->month;
+
+    uint8_t sr_h = (uint8_t)sunrise_h;
+    uint8_t sr_m = (uint8_t)((sunrise_h - (float)sr_h) * 60.0f);
+    uint8_t ss_h = (uint8_t)s_sunset_cutoff_hours;
+    uint8_t ss_m = (uint8_t)((s_sunset_cutoff_hours - (float)ss_h) * 60.0f);
+    LOG("[Blinds] Sun schedule for %02u-%02u: sunrise=%02u:%02u, lower-at=%02u:%02u (DST=%d).\n",
+        dt->month, dt->date, sr_h, sr_m, ss_h, ss_m, (int)dst_active);
 }

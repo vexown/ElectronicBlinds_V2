@@ -42,9 +42,11 @@
  *
  * @section AutoSchedule
  *
- * Between BLINDS_DAYTIME_START_HOUR and BLINDS_NIGHTTIME_START_HOUR the
- * controller raises the blinds; outside that window it lowers them.
- * Adjust the hour constants below to match your location/preference.
+ * The controller raises the blinds at local sunrise and lowers them
+ * BLINDS_SUNSET_OFFSET_HOURS after local sunset. Sunrise and sunset are
+ * computed from the DS3231 date using the NOAA solar algorithm for the
+ * configured latitude/longitude (see time_calculations.h). DST is applied
+ * automatically for the EU schedule.
  *
  * @section ManualOverride
  *
@@ -80,11 +82,13 @@
 /*                             AUTOMATIC SCHEDULE                              */
 /*******************************************************************************/
 
-/** @brief Hour (0–23) at which the blinds are raised each day. */
-#define BLINDS_DAYTIME_START_HOUR   10U
-
-/** @brief Hour (0–23) at which the blinds are lowered each day. */
-#define BLINDS_NIGHTTIME_START_HOUR 17U
+/**
+ * @brief Delay (in decimal hours) between local sunset and the auto lowering.
+ *
+ * The blinds are lowered at (sunset + this offset). 0.5 means 30 minutes after
+ * sunset, giving some dusk before the blinds drop.
+ */
+#define BLINDS_SUNSET_OFFSET_HOURS  0.5f
 
 /*******************************************************************************/
 /*                              MOTOR CONFIGURATION                            */
