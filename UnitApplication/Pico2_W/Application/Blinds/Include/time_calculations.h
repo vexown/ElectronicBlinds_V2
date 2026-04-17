@@ -63,26 +63,25 @@ void CalculateSunriseSunset(float latitude, float longitude, int dayOfYear, int 
 
 /**
  * @brief Computes the cumulative day of the year (1 to 366).
- * Converts BCD date components to decimal, accounts for leap years, and sums
- * the days in the preceding months.
- * @param yearBCD   The year in BCD format (e.g., 0x24 for 2024).
- * @param monthBCD  The month in BCD format (0x01 to 0x12).
- * @param dayBCD    The day in BCD format (0x01 to 0x31).
+ * Accounts for leap years and sums the days in the preceding months.
+ * @param year   Year within the 2000s (0–99, e.g. 25 for 2025).
+ * @param month  Month, 1–12.
+ * @param day    Day of month, 1–31.
  * @return uint32_t The day number of the year.
  */
-uint32_t CalculateDayOfYear(uint32_t yearBCD, uint32_t monthBCD, uint32_t dayBCD);
+uint32_t CalculateDayOfYear(uint8_t year, uint8_t month, uint8_t day);
 
 /**
  * @brief Determines if Daylight Saving Time (DST) is active for a given date.
- * This implementation follows the European Union standard: DST starts on the 
+ * This implementation follows the European Union standard: DST starts on the
  * last Sunday of March and ends on the last Sunday of October.
- * @param yearBCD   The year in BCD format.
- * @param monthBCD  The month in BCD format.
- * @param dayBCD    The day in BCD format.
- * @return true     If the date falls within the DST period.
- * @return false    If the date is in standard time.
+ * @param year   Year within the 2000s (0–99, e.g. 25 for 2025).
+ * @param month  Month, 1–12.
+ * @param day    Day of month, 1–31.
+ * @return true  If the date falls within the DST period.
+ * @return false If the date is in standard time.
  */
-bool isDST(uint32_t yearBCD, uint32_t monthBCD, uint32_t dayBCD);
+bool isDST(uint8_t year, uint8_t month, uint8_t day);
 
 /**
  * @brief Converts values between Decimal and Binary Coded Decimal (BCD).

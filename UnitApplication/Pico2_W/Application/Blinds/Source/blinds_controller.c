@@ -438,19 +438,11 @@ static float rtc_decimal_hours(const DS3231_DateTime *dt)
 
 /**
  * @brief Recompute cached sunrise / (sunset + offset) for the given date.
- *
- * The NOAA helpers in time_calculations.c expect BCD inputs, while the DS3231
- * HAL exposes plain decimal fields, so each field is converted here before
- * the call.
  */
 static void recalculate_sun_schedule(const DS3231_DateTime *dt)
 {
-    uint32_t year_bcd  = (uint32_t)ConvertBCD((uint16_t)dt->year,  DEC_TO_BCD);
-    uint32_t month_bcd = (uint32_t)ConvertBCD((uint16_t)dt->month, DEC_TO_BCD);
-    uint32_t date_bcd  = (uint32_t)ConvertBCD((uint16_t)dt->date,  DEC_TO_BCD);
-
-    int  day_of_year = (int)CalculateDayOfYear(year_bcd, month_bcd, date_bcd);
-    bool dst_active  = isDST(year_bcd, month_bcd, date_bcd);
+    int  day_of_year = (int)CalculateDayOfYear(dt->year, dt->month, dt->date);
+    bool dst_active  = isDST(dt->year, dt->month, dt->date);
     int  timezone    = TIME_ZONE_PLUS_TO_E + (dst_active ? 1 : 0);
 
     float sunrise_h = 0.0f;

@@ -46,13 +46,13 @@ uint8_t ConvertBCD(uint16_t valueToConvert, uint8_t direction)
     return convertedValue;
 }
 
-bool isDST(uint32_t yearBCD, uint32_t monthBCD, uint32_t dayBCD)
+bool isDST(uint8_t year, uint8_t month, uint8_t day)
 {
     bool isTodayDST = false;
 
-    uint32_t dayDEC = ConvertBCD((uint16_t)dayBCD, BCD_TO_DEC);
-    uint32_t monthDEC = ConvertBCD((uint16_t)monthBCD, BCD_TO_DEC);
-    uint32_t yearDEC = ConvertBCD((uint16_t)yearBCD, BCD_TO_DEC) + 2000; /* This code only works for 2nd millennium, should be enough lol */
+    uint32_t dayDEC = day;
+    uint32_t monthDEC = month;
+    uint32_t yearDEC = (uint32_t)year + 2000U; /* This code only works for 2nd millennium, should be enough lol */
 
     /* Check if DST is in effect (last Sunday in March to last Sunday in October) */
     if (monthDEC >= 3 && monthDEC <= 10) 
@@ -92,11 +92,11 @@ bool isDST(uint32_t yearBCD, uint32_t monthBCD, uint32_t dayBCD)
     return isTodayDST;
 }
 
-uint32_t CalculateDayOfYear(uint32_t yearBCD, uint32_t monthBCD, uint32_t dayBCD) 
+uint32_t CalculateDayOfYear(uint8_t year, uint8_t month, uint8_t day)
 {
-    uint32_t dayDEC = ConvertBCD((uint16_t)dayBCD, BCD_TO_DEC);
-    uint32_t monthDEC = ConvertBCD((uint16_t)monthBCD, BCD_TO_DEC);
-    uint32_t yearDEC = ConvertBCD((uint16_t)yearBCD, BCD_TO_DEC) + 2000; /* This code only works for 2nd millennium, should be enough lol */
+    uint32_t dayDEC = day;
+    uint32_t monthDEC = month;
+    uint32_t yearDEC = (uint32_t)year + 2000U; /* This code only works for 2nd millennium, should be enough lol */
 
     uint32_t daysInMonth[] = {0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
     
