@@ -123,9 +123,11 @@ static uint32_t             s_manual_idle_count = 0U;
 /* Double-tap full-run state.
  * s_up_tap_countdown / s_down_tap_countdown: decremented every task call after
  *   a single tap; a second tap while non-zero triggers a full run.
- * s_full_run: true while the motor is running unattended (double-tap or auto).
- *   Used both to keep the motor going on button release and as the gate for
- *   the watchdog interrupt-on-press behaviour. */
+ * s_full_run: true ONLY during a double-tap full-run (NOT during auto). It
+ *   keeps the motor going past button release and gates the interrupt-on-
+ *   press block. Auto runs use the normal manual-button branches for
+ *   interruption — overloading s_full_run for auto would make any button
+ *   press merely stop-and-restart the auto run. */
 static uint32_t             s_up_tap_countdown   = 0U;
 static uint32_t             s_down_tap_countdown = 0U;
 static bool                 s_full_run           = false;
@@ -506,14 +508,17 @@ static void handle_auto_control(bool at_top, bool at_bottom)
 
     if (daytime && !at_top)
     {
-        s_full_run = true;  /* Auto runs unattended — same watchdog rules apply. */
+        /* Note: s_full_run stays false. Auto runs are interrupted via the
+         * normal manual-button branches (which set s_mode = MANUAL and
+         * s_auto_target_reached = true), not via the full-run interrupt
+         * block. The watchdog still bounds the run — it triggers off
+         * s_state != IDLE and does not depend on s_full_run. */
         start_motion(BLINDS_STATE_MOVING_UP, at_top, at_bottom);
         LOG("[Blinds] Auto: raising blinds (%02u:%02u).\n",
             s_rtc_snapshot.hours, s_rtc_snapshot.minutes);
     }
     else if (!daytime && !at_bottom)
     {
-        s_full_run = true;
         start_motion(BLINDS_STATE_MOVING_DOWN, at_top, at_bottom);
         LOG("[Blinds] Auto: lowering blinds (%02u:%02u).\n",
             s_rtc_snapshot.hours, s_rtc_snapshot.minutes);
