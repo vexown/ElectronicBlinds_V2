@@ -39,6 +39,7 @@
 #include "h_bridge_controller.h"
 #include "DS3231_HAL.h"
 #include "time_calculations.h"
+#include "flash_operations.h"
 #include "Common.h"
 
 /*******************************************************************************/
@@ -48,6 +49,10 @@
 /** Number of task calls that make up BLINDS_MANUAL_TIMEOUT_S. */
 #define MANUAL_TIMEOUT_CALLS \
     ((uint32_t)(BLINDS_MANUAL_TIMEOUT_S) * 1000U / (BLINDS_TASK_PERIOD_MS))
+
+/** Number of task calls within which a second tap counts as a double-tap. */
+#define DOUBLE_TAP_WINDOW_CALLS \
+    ((uint32_t)(BLINDS_DOUBLE_TAP_WINDOW_MS) / (BLINDS_TASK_PERIOD_MS))
 
 /*******************************************************************************/
 /*                               DATA TYPES                                    */
@@ -81,6 +86,15 @@ static void         handle_manual_buttons(bool at_top, bool at_bottom);
 static void         handle_auto_control(bool at_top, bool at_bottom);
 static void         poll_rtc(void);
 
+/* Motion bookkeeping — wrap motor_start_up/down so every motion is timed,
+ * watchdogged, and contributes to position tracking / calibration. */
+static void         start_motion(Blinds_InternalState dir, bool at_top, bool at_bottom);
+static void         stop_motion(void);
+static void         motion_update_position(void);
+static bool         motion_check_watchdog(void);
+static void         motion_try_calibrate(bool reached_top);
+static uint32_t     expected_travel_ms(Blinds_InternalState dir);
+
 /*******************************************************************************/
 /*                             STATIC VARIABLES                                */
 /*******************************************************************************/
@@ -105,6 +119,43 @@ static uint8_t              s_schedule_month      = 0U;
  * press/release event. When it reaches MANUAL_TIMEOUT_CALLS the controller
  * reverts to AUTO. */
 static uint32_t             s_manual_idle_count = 0U;
+
+/* Double-tap full-run state.
+ * s_up_tap_countdown / s_down_tap_countdown: decremented every task call after
+ *   a single tap; a second tap while non-zero triggers a full run.
+ * s_full_run: true while the motor is running unattended (double-tap or auto).
+ *   Used both to keep the motor going on button release and as the gate for
+ *   the watchdog interrupt-on-press behaviour. */
+static uint32_t             s_up_tap_countdown   = 0U;
+static uint32_t             s_down_tap_countdown = 0U;
+static bool                 s_full_run           = false;
+
+/* Set true after a watchdog trip. Blocks new double-tap full-runs until the
+ * next clean limit hit proves the switches are working and re-zeroes
+ * position. Manual hold-to-move stays available so the user can recover. */
+static bool                 s_full_run_locked_out = false;
+
+/* Monotonic task-cycle counter. Used as the time base for watchdog and
+ * calibration measurements (each tick = BLINDS_TASK_PERIOD_MS). */
+static uint32_t             s_call_count         = 0U;
+
+/* Travel-time calibration (ms), loaded from flash at init and updated
+ * opportunistically when a motion completes from one limit to the other.
+ * 0 means "uncalibrated" — the watchdog falls back to BLINDS_TRAVEL_DEFAULT_MS. */
+static uint32_t             s_travel_up_ms       = 0U;
+static uint32_t             s_travel_down_ms     = 0U;
+
+/* Snapshot of the active motion. Captured by start_motion() and consumed by
+ * motion_check_watchdog() / motion_try_calibrate() / motion_update_position(). */
+static uint32_t             s_motion_start_calls    = 0U;
+static bool                 s_motion_started_at_top    = false;
+static bool                 s_motion_started_at_bottom = false;
+static uint16_t             s_motion_start_position    = BLINDS_POSITION_UNKNOWN;
+
+/* Dead-reckoning position estimate, 0 (bottom) .. 1000 (top). Re-zeroed at
+ * every limit hit; invalidated to BLINDS_POSITION_UNKNOWN by a watchdog trip
+ * or whenever a motion starts from an unknown position with no calibration. */
+static uint16_t             s_position_permille  = BLINDS_POSITION_UNKNOWN;
 
 /* Auto-schedule state.
  * s_auto_target_reached: set when the blinds arrive at the auto target for
@@ -194,24 +245,46 @@ Blinds_Status Blinds_Init(void)
     s_auto_last_daytime   = !is_daytime(rtc_decimal_hours(&s_rtc_snapshot)); /* force mismatch */
     s_auto_target_reached = false;
 
+    /* --- 4. Travel-time calibration ---------------------------------------- */
+    if (read_blinds_calibration(&s_travel_up_ms, &s_travel_down_ms))
+    {
+        LOG("[Blinds] Calibration loaded: T_up=%u ms, T_down=%u ms.\n",
+            (unsigned)s_travel_up_ms, (unsigned)s_travel_down_ms);
+    }
+    else
+    {
+        s_travel_up_ms   = 0U;
+        s_travel_down_ms = 0U;
+        LOG("[Blinds] No travel calibration in flash. Using default %u ms watchdog "
+            "until first opportunistic calibration completes.\n",
+            (unsigned)BLINDS_TRAVEL_DEFAULT_MS);
+    }
+
     LOG("[Blinds] Initialized. Mode: AUTO.\n");
     return BLINDS_OK;
 }
 
 void Blinds_MainFunction(void)
 {
+    s_call_count++;
+
     /* Snapshot debounced limit-switch states once per cycle. */
     bool at_top    = Debounce_IsHeld(BLINDS_LIMIT_TOP_PIN);
     bool at_bottom = Debounce_IsHeld(BLINDS_LIMIT_BOTTOM_PIN);
 
     /* Process in priority order:
-     *  1. Safety stop at limits (highest priority — always checked).
-     *  2. Manual button commands.
-     *  3. Auto schedule (only when manual is idle). */
+     *  1. Watchdog (catches a runaway motor before any other state change
+     *     this cycle — e.g. broken limit switch).
+     *  2. Safety stop at limits.
+     *  3. Manual button commands (incl. double-tap full-run gesture).
+     *  4. Auto schedule (only when manual is idle).
+     *  5. Update dead-reckoned position estimate. */
+    (void)motion_check_watchdog();
     handle_limit_switches(at_top, at_bottom);
     handle_manual_buttons(at_top, at_bottom);
     poll_rtc();
     handle_auto_control(at_top, at_bottom);
+    motion_update_position();
 }
 
 /*******************************************************************************/
@@ -228,22 +301,26 @@ static void handle_limit_switches(bool at_top, bool at_bottom)
 
     if (s_state == BLINDS_STATE_MOVING_UP && at_top)
     {
-        motor_stop();
-        s_state = BLINDS_STATE_IDLE;
-        s_mode  = BLINDS_MODE_AUTO; /* Position is known — safe to hand back to auto. */
-        s_manual_idle_count   = 0U;
-        s_auto_target_reached = true;  /* Don't raise again until day/night flips. */
-        s_auto_last_daytime   = is_daytime(now_h);
+        motion_try_calibrate(true);   /* before stop_motion clears the snapshot */
+        stop_motion();
+        s_mode  = BLINDS_MODE_AUTO;   /* Position is known — safe to hand back to auto. */
+        s_manual_idle_count    = 0U;
+        s_auto_target_reached  = true;  /* Don't raise again until day/night flips. */
+        s_auto_last_daytime    = is_daytime(now_h);
+        s_position_permille    = 1000U;  /* Re-zero dead reckoning. */
+        s_full_run_locked_out  = false;  /* Switch proven working — re-arm full-run. */
         LOG("[Blinds] TOP limit reached. Motor stopped.\n");
     }
     else if (s_state == BLINDS_STATE_MOVING_DOWN && at_bottom)
     {
-        motor_stop();
-        s_state = BLINDS_STATE_IDLE;
+        motion_try_calibrate(false);
+        stop_motion();
         s_mode  = BLINDS_MODE_AUTO;
-        s_manual_idle_count   = 0U;
-        s_auto_target_reached = true;  /* Don't lower again until day/night flips. */
-        s_auto_last_daytime   = is_daytime(now_h);
+        s_manual_idle_count    = 0U;
+        s_auto_target_reached  = true;  /* Don't lower again until day/night flips. */
+        s_auto_last_daytime    = is_daytime(now_h);
+        s_position_permille    = 0U;
+        s_full_run_locked_out  = false;
         LOG("[Blinds] BOTTOM limit reached. Motor stopped.\n");
     }
 }
@@ -251,10 +328,13 @@ static void handle_limit_switches(bool at_top, bool at_bottom)
 /**
  * @brief Handle UP/DOWN button presses, holds, and releases.
  *
- * A button press puts the controller into MANUAL mode and starts the motor.
- * The motor runs for as long as the button is held.  On release the motor
- * stops and the manual-inactivity timer starts.  After BLINDS_MANUAL_TIMEOUT_S
- * seconds of no button activity the mode reverts to AUTO.
+ * Single tap: motor runs while the button is held; stops on release.
+ * Double-tap (second press within BLINDS_DOUBLE_TAP_WINDOW_MS): motor runs to
+ *   the corresponding limit switch without needing to hold the button.
+ *   Any subsequent press interrupts the full run. Locked out while
+ *   s_full_run_locked_out is set (cleared on the next clean limit hit).
+ * After BLINDS_MANUAL_TIMEOUT_S seconds of button inactivity the mode reverts
+ *   to AUTO.
  */
 static void handle_manual_buttons(bool at_top, bool at_bottom)
 {
@@ -263,50 +343,91 @@ static void handle_manual_buttons(bool at_top, bool at_bottom)
     bool up_held      = Debounce_IsHeld(BLINDS_BTN_UP_PIN);
     bool down_held    = Debounce_IsHeld(BLINDS_BTN_DOWN_PIN);
 
+    /* Advance double-tap countdown windows. */
+    if (s_up_tap_countdown   > 0U) s_up_tap_countdown--;
+    if (s_down_tap_countdown > 0U) s_down_tap_countdown--;
+
     /* Any button event resets the inactivity timer. */
     if (up_pressed || down_pressed || up_held || down_held)
     {
         s_manual_idle_count = 0U;
     }
 
+    /* --- Interrupt a full run on any button press -------------------------- */
+    if (s_full_run && (up_pressed || down_pressed))
+    {
+        stop_motion();
+        s_up_tap_countdown   = 0U;
+        s_down_tap_countdown = 0U;
+        LOG("[Blinds] Full run interrupted by button press.\n");
+        return;
+    }
+
     /* --- UP button pressed ------------------------------------------------- */
     if (up_pressed && !at_top)
     {
-        /* Stop any ongoing movement before changing direction. If auto was in
-         * progress, mark its target as reached so it won't restart after the
-         * manual timeout. */
-        if (s_state != BLINDS_STATE_IDLE)
+        if (s_up_tap_countdown > 0U && !s_full_run_locked_out)
         {
-            motor_stop();
-            s_auto_target_reached = true;
+            /* Double-tap: upgrade to full run — motor keeps going without hold. */
+            s_up_tap_countdown = 0U;
+            if (s_state != BLINDS_STATE_IDLE) stop_motion();  /* clean transition */
+            s_full_run = true;
+            s_mode     = BLINDS_MODE_MANUAL;
+            start_motion(BLINDS_STATE_MOVING_UP, at_top, at_bottom);
+            LOG("[Blinds] Full run UP triggered.\n");
         }
-        s_mode  = BLINDS_MODE_MANUAL;
-        s_state = BLINDS_STATE_MOVING_UP;
-        motor_start_up();
-        LOG("[Blinds] Manual UP.\n");
+        else
+        {
+            /* First tap (or post-trip lockout): normal hold-to-move. Clear the
+             * opposite countdown so a direction change can't accidentally arm
+             * a full run. */
+            s_up_tap_countdown   = DOUBLE_TAP_WINDOW_CALLS;
+            s_down_tap_countdown = 0U;
+            if (s_state != BLINDS_STATE_IDLE)
+            {
+                stop_motion();
+                s_auto_target_reached = true;
+            }
+            s_mode = BLINDS_MODE_MANUAL;
+            start_motion(BLINDS_STATE_MOVING_UP, at_top, at_bottom);
+            LOG("[Blinds] Manual UP.\n");
+        }
     }
 
     /* --- DOWN button pressed ----------------------------------------------- */
     if (down_pressed && !at_bottom)
     {
-        if (s_state != BLINDS_STATE_IDLE)
+        if (s_down_tap_countdown > 0U && !s_full_run_locked_out)
         {
-            motor_stop();
-            s_auto_target_reached = true;
+            /* Double-tap: upgrade to full run. */
+            s_down_tap_countdown = 0U;
+            if (s_state != BLINDS_STATE_IDLE) stop_motion();
+            s_full_run = true;
+            s_mode     = BLINDS_MODE_MANUAL;
+            start_motion(BLINDS_STATE_MOVING_DOWN, at_top, at_bottom);
+            LOG("[Blinds] Full run DOWN triggered.\n");
         }
-        s_mode  = BLINDS_MODE_MANUAL;
-        s_state = BLINDS_STATE_MOVING_DOWN;
-        motor_start_down();
-        LOG("[Blinds] Manual DOWN.\n");
+        else
+        {
+            s_down_tap_countdown = DOUBLE_TAP_WINDOW_CALLS;
+            s_up_tap_countdown   = 0U;
+            if (s_state != BLINDS_STATE_IDLE)
+            {
+                stop_motion();
+                s_auto_target_reached = true;
+            }
+            s_mode = BLINDS_MODE_MANUAL;
+            start_motion(BLINDS_STATE_MOVING_DOWN, at_top, at_bottom);
+            LOG("[Blinds] Manual DOWN.\n");
+        }
     }
 
-    /* --- Stop when both buttons released (manual mode only) ---------------- */
-    if (s_mode == BLINDS_MODE_MANUAL && s_state != BLINDS_STATE_IDLE)
+    /* --- Stop on button release (hold-to-move only, not during full run) --- */
+    if (s_mode == BLINDS_MODE_MANUAL && s_state != BLINDS_STATE_IDLE && !s_full_run)
     {
         if (!up_held && !down_held)
         {
-            motor_stop();
-            s_state = BLINDS_STATE_IDLE;
+            stop_motion();
             LOG("[Blinds] Button released. Motor stopped (manual idle).\n");
         }
     }
@@ -379,15 +500,15 @@ static void handle_auto_control(bool at_top, bool at_bottom)
 
     if (daytime && !at_top)
     {
-        motor_start_up();
-        s_state = BLINDS_STATE_MOVING_UP;
+        s_full_run = true;  /* Auto runs unattended — same watchdog rules apply. */
+        start_motion(BLINDS_STATE_MOVING_UP, at_top, at_bottom);
         LOG("[Blinds] Auto: raising blinds (%02u:%02u).\n",
             s_rtc_snapshot.hours, s_rtc_snapshot.minutes);
     }
     else if (!daytime && !at_bottom)
     {
-        motor_start_down();
-        s_state = BLINDS_STATE_MOVING_DOWN;
+        s_full_run = true;
+        start_motion(BLINDS_STATE_MOVING_DOWN, at_top, at_bottom);
         LOG("[Blinds] Auto: lowering blinds (%02u:%02u).\n",
             s_rtc_snapshot.hours, s_rtc_snapshot.minutes);
     }
@@ -461,4 +582,151 @@ static void recalculate_sun_schedule(const DS3231_DateTime *dt)
     uint8_t ss_m = (uint8_t)((s_sunset_cutoff_hours - (float)ss_h) * 60.0f);
     LOG("[Blinds] Sun schedule for %02u-%02u: sunrise=%02u:%02u, lower-at=%02u:%02u (DST=%d).\n",
         dt->month, dt->date, sr_h, sr_m, ss_h, ss_m, (int)dst_active);
+}
+
+/* --- Motion bookkeeping --------------------------------------------------- */
+
+/**
+ * @brief Travel time (ms) the watchdog and position estimator should assume
+ *        for the given direction. Falls back to the conservative default
+ *        when no calibration is available yet.
+ */
+static uint32_t expected_travel_ms(Blinds_InternalState dir)
+{
+    if (dir == BLINDS_STATE_MOVING_UP)
+    {
+        return (s_travel_up_ms != 0U) ? s_travel_up_ms : BLINDS_TRAVEL_DEFAULT_MS;
+    }
+    return (s_travel_down_ms != 0U) ? s_travel_down_ms : BLINDS_TRAVEL_DEFAULT_MS;
+}
+
+/**
+ * @brief Start a motion in the given direction. Captures the call-count
+ *        timestamp, the limit-switch state at start (used by the
+ *        opportunistic calibrator), and the starting position (used as the
+ *        anchor for dead reckoning so direction changes don't accumulate
+ *        rounding error).
+ */
+static void start_motion(Blinds_InternalState dir, bool at_top, bool at_bottom)
+{
+    s_state                    = dir;
+    s_motion_start_calls       = s_call_count;
+    s_motion_started_at_top    = at_top;
+    s_motion_started_at_bottom = at_bottom;
+    s_motion_start_position    = s_position_permille;
+
+    if (dir == BLINDS_STATE_MOVING_UP) motor_start_up();
+    else                               motor_start_down();
+}
+
+/**
+ * @brief Stop the motor and clear motion state. Does NOT touch position,
+ *        calibration, or the lock-out flag — those are owned by the limit
+ *        switch handler and the watchdog.
+ */
+static void stop_motion(void)
+{
+    motor_stop();
+    s_state    = BLINDS_STATE_IDLE;
+    s_full_run = false;
+}
+
+/**
+ * @brief Integrate the dead-reckoned position estimate from the motion's
+ *        start anchor. Recomputed from start each tick (rather than
+ *        accumulated) to avoid integer-division drift.
+ */
+static void motion_update_position(void)
+{
+    if (s_state == BLINDS_STATE_IDLE) return;
+    if (s_motion_start_position == BLINDS_POSITION_UNKNOWN) return;
+
+    uint32_t elapsed_ms = (s_call_count - s_motion_start_calls) * BLINDS_TASK_PERIOD_MS;
+    uint32_t t_full_ms  = expected_travel_ms(s_state);
+    uint32_t delta      = (1000U * elapsed_ms) / t_full_ms;
+
+    if (s_state == BLINDS_STATE_MOVING_UP)
+    {
+        uint32_t pos = (uint32_t)s_motion_start_position + delta;
+        s_position_permille = (pos > 1000U) ? 1000U : (uint16_t)pos;
+    }
+    else
+    {
+        if (delta >= s_motion_start_position) s_position_permille = 0U;
+        else                                  s_position_permille = (uint16_t)(s_motion_start_position - delta);
+    }
+}
+
+/**
+ * @brief Trip the watchdog if the current motion has run longer than
+ *        BLINDS_TRAVEL_WATCHDOG_PCT % of the expected travel time. On a trip:
+ *        stops the motor, marks position as unknown, and locks out the
+ *        double-tap full-run feature until the next clean limit hit
+ *        (which proves the switches are working).
+ */
+static bool motion_check_watchdog(void)
+{
+    if (s_state == BLINDS_STATE_IDLE) return false;
+
+    uint32_t elapsed_ms  = (s_call_count - s_motion_start_calls) * BLINDS_TASK_PERIOD_MS;
+    uint32_t expected_ms = expected_travel_ms(s_state);
+    uint32_t limit_ms    = (expected_ms * BLINDS_TRAVEL_WATCHDOG_PCT) / 100U;
+    if (elapsed_ms < limit_ms) return false;
+
+    Blinds_InternalState dir = s_state;
+    stop_motion();
+    s_position_permille    = BLINDS_POSITION_UNKNOWN;
+    s_full_run_locked_out  = true;
+    s_up_tap_countdown     = 0U;
+    s_down_tap_countdown   = 0U;
+    /* Drop back to AUTO so the manual-timeout state machine doesn't sit
+     * idle forever. The next auto attempt will retry — but if the limit
+     * is genuinely broken, the watchdog will trip again. */
+    s_mode = BLINDS_MODE_AUTO;
+    LOG("[Blinds] SAFETY: watchdog tripped after %u ms moving %s (expected %u ms). "
+        "Motor stopped. Full-run locked until the next limit hit.\n",
+        (unsigned)elapsed_ms,
+        (dir == BLINDS_STATE_MOVING_UP) ? "UP" : "DOWN",
+        (unsigned)expected_ms);
+    return true;
+}
+
+/**
+ * @brief Opportunistic calibration: if the motion that just reached this
+ *        limit started at the opposite limit, the elapsed time is a valid
+ *        full-travel measurement. Stored in RAM and persisted to flash if
+ *        it differs meaningfully from what's already stored.
+ */
+static void motion_try_calibrate(bool reached_top)
+{
+    bool valid_start = reached_top ? s_motion_started_at_bottom
+                                   : s_motion_started_at_top;
+    if (!valid_start) return;
+
+    uint32_t elapsed_ms = (s_call_count - s_motion_start_calls) * BLINDS_TASK_PERIOD_MS;
+    if (elapsed_ms < BLINDS_TRAVEL_MIN_MS || elapsed_ms > BLINDS_TRAVEL_MAX_MS)
+    {
+        LOG("[Blinds] Calibration: rejecting implausible measurement (%u ms).\n",
+            (unsigned)elapsed_ms);
+        return;
+    }
+
+    uint32_t *stored = reached_top ? &s_travel_up_ms : &s_travel_down_ms;
+    uint32_t  old_val = *stored;
+    *stored = elapsed_ms;
+
+    uint32_t delta = (elapsed_ms > old_val) ? (elapsed_ms - old_val)
+                                            : (old_val - elapsed_ms);
+    if (old_val == 0U || delta >= BLINDS_TRAVEL_WRITE_DELTA_MS)
+    {
+        if (write_blinds_calibration(s_travel_up_ms, s_travel_down_ms))
+        {
+            LOG("[Blinds] Calibration saved: T_up=%u ms, T_down=%u ms.\n",
+                (unsigned)s_travel_up_ms, (unsigned)s_travel_down_ms);
+        }
+        else
+        {
+            LOG("[Blinds] WARNING: failed to persist calibration to flash.\n");
+        }
+    }
 }

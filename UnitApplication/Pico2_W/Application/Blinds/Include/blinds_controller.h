@@ -54,6 +54,28 @@
  * button is held (or until the corresponding limit switch fires).
  * After BLINDS_MANUAL_TIMEOUT_S seconds of button inactivity the controller
  * returns to automatic mode.
+ *
+ * Double-tapping UP or DOWN (two presses within BLINDS_DOUBLE_TAP_WINDOW_MS)
+ * starts a full run to the corresponding limit switch without requiring the
+ * button to be held. Any subsequent button press interrupts the run.
+ *
+ * @section Safety
+ *
+ * Any motor run (auto, double-tap full-run, or hold-to-move) is bounded by a
+ * watchdog: if travel time exceeds BLINDS_TRAVEL_WATCHDOG_PCT of the
+ * calibrated travel for the current direction, the motor is force-stopped,
+ * the position estimate is invalidated, and the double-tap full-run feature
+ * is locked out until the next clean limit hit. This protects the mechanism
+ * from a stuck or broken limit switch.
+ *
+ * Travel-time calibration is learned opportunistically: any run that starts
+ * at one limit and ends at the opposite limit is timed and (if it differs
+ * from the stored value by more than BLINDS_TRAVEL_WRITE_DELTA_MS) persisted
+ * to flash via the boot metadata sector.
+ *
+ * Position is tracked by dead reckoning between limit hits (linear
+ * interpolation against the calibrated travel time). The estimate is
+ * re-zeroed at every limit, so errors do not accumulate across full cycles.
  */
 
 #ifndef BLINDS_CONTROLLER_H
@@ -125,6 +147,56 @@
 
 /** @brief How often (in task calls) to read the RTC. 20 × 50 ms = 1 s. */
 #define BLINDS_RTC_POLL_CALLS       20U
+
+/**
+ * @brief Maximum gap (ms) between two taps to be recognised as a double-tap.
+ *
+ * Double-tapping UP or DOWN starts a full run to the corresponding limit
+ * without requiring the button to be held. A single subsequent tap interrupts.
+ */
+#define BLINDS_DOUBLE_TAP_WINDOW_MS 500U
+
+/*******************************************************************************/
+/*                       SAFETY / CALIBRATION CONSTANTS                        */
+/*******************************************************************************/
+
+/**
+ * @brief Watchdog trip threshold as a percentage of calibrated travel time.
+ *
+ * The motor is force-stopped if travel time exceeds this fraction of the
+ * calibrated value (e.g. 130 means stop after 1.30 × expected travel).
+ * Lower = stricter protection but more false positives from motor variance.
+ */
+#define BLINDS_TRAVEL_WATCHDOG_PCT  130U
+
+/**
+ * @brief Travel time (ms) the watchdog assumes when no calibration exists.
+ *
+ * Used on first boot and after any uncalibrated firmware upgrade. Picked
+ * conservatively so the watchdog still trips before damage on any plausible
+ * blind, while not interrupting a normal slow blind.
+ */
+#define BLINDS_TRAVEL_DEFAULT_MS    60000U
+
+/** @brief Minimum plausible full-travel time (ms). Shorter measurements are
+ *  rejected as glitches rather than written to calibration. */
+#define BLINDS_TRAVEL_MIN_MS        2000U
+
+/** @brief Maximum plausible full-travel time (ms). */
+#define BLINDS_TRAVEL_MAX_MS        120000U
+
+/**
+ * @brief Minimum delta (ms) between a fresh measurement and the stored
+ *        calibration before the new value is written to flash.
+ *
+ * Avoids burning a flash erase cycle on every single full run for tiny
+ * measurement-to-measurement jitter.
+ */
+#define BLINDS_TRAVEL_WRITE_DELTA_MS 500U
+
+/** @brief Sentinel position value meaning "we have no idea where the blind
+ *  is — recover by reaching a limit switch." */
+#define BLINDS_POSITION_UNKNOWN     0xFFFFU
 
 /*******************************************************************************/
 /*                                 STATUS CODES                                */
