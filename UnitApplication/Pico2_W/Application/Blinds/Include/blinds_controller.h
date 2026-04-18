@@ -167,10 +167,10 @@
  * @brief Watchdog trip threshold as a percentage of calibrated travel time.
  *
  * The motor is force-stopped if travel time exceeds this fraction of the
- * calibrated value (e.g. 130 means stop after 1.30 × expected travel).
+ * calibrated value (e.g. 120 means stop after 1.20 × expected travel).
  * Lower = stricter protection but more false positives from motor variance.
  */
-#define BLINDS_TRAVEL_WATCHDOG_PCT  130U
+#define BLINDS_TRAVEL_WATCHDOG_PCT  120U
 
 /**
  * @brief Travel time (ms) the watchdog assumes when no calibration exists.
