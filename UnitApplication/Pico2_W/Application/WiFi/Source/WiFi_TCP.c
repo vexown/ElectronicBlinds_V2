@@ -59,6 +59,11 @@ static SemaphoreHandle_t bufferMutex;
 /* Mutex for sending data */
 static SemaphoreHandle_t sendMutex;
 
+#if (PICO_W_AS_TCP_SERVER == OFF)
+/* Counts consecutive failed connection attempts; reset to 0 on success */
+static uint32_t tcp_reconnect_count = 0;
+#endif
+
 /*******************************************************************************/
 /*                         STATIC FUNCTION DECLARATIONS                        */
 /*******************************************************************************/
@@ -467,7 +472,7 @@ bool tcp_client_connect(const char *host, uint16_t port)
            in the tcp CLOSED state. It is the only state from which we can attempt to tcp_connect */
         if(clientGlobal->pcb->state == CLOSED)
         {
-            LOG("TCP state is CLOSED. Attempting to connect... \n");
+            /* CLOSED state is the only valid state from which tcp_connect can be called */
         }
         else
         {
@@ -501,9 +506,12 @@ bool tcp_client_connect(const char *host, uint16_t port)
     while (!tcp_client_is_connected() && !clientGlobal->is_closing) 
     {
         /* Check if timeout has occurred */
-        if ((xTaskGetTickCount() - xStartTime) > xTimeoutTicks) 
+        if ((xTaskGetTickCount() - xStartTime) > xTimeoutTicks)
         {
-            LOG("Connection timeout\n");
+            if (tcp_reconnect_count == 1 || tcp_reconnect_count % 10 == 0)
+            {
+                LOG("Connection timeout (attempt %lu)\n", (unsigned long)tcp_reconnect_count);
+            }
             WiFiState = INIT; // Reinitialize the TCP client in attempt to connect again
             return false;
         }
@@ -642,7 +650,10 @@ void tcp_client_disconnect(void)
     }
     else if(clientGlobal != NULL && clientGlobal->pcb == NULL)
     {
-        LOG("Client PCB is NULL but client itself is not. Cleaning up...\n");
+        if (tcp_reconnect_count == 1 || tcp_reconnect_count % 10 == 0)
+        {
+            LOG("Client PCB is NULL but client itself is not. Cleaning up...\n");
+        }
         tcp_client_cleanup();
     }
     else
@@ -673,35 +684,38 @@ bool start_TCP_client(const char *host, uint16_t port)
     }
     else if (clientGlobal != NULL && !tcp_client_is_connected())
     {
-        LOG("TCP client is initialized but the connection is not established. Freeing resources and reinitializing... \n");
+        if (tcp_reconnect_count == 1 || tcp_reconnect_count % 10 == 0)
+        {
+            LOG("TCP client is initialized but the connection is not established. Freeing resources and reinitializing... \n");
+        }
         status = false;
-        
+
         tcp_client_disconnect(); // Disconnect and free the resources
     }
     else
     {
-        LOG("Initializing the TCP client... \n");
         clientGlobal = tcp_client_init();
 
-        if (clientGlobal != NULL) 
-        {
-            LOG("TCP client initialized successfully\n");
-        } 
-        else 
+        if (clientGlobal == NULL)
         {
             LOG("TCP client initialization failed\n");
             status = false;
         }
 
+        tcp_reconnect_count++;
         bool connected = tcp_client_connect(host, port);
-        if (!connected) 
+        if (!connected)
         {
-            LOG("Failed to connect to the TCP server\n");
+            if (tcp_reconnect_count == 1 || tcp_reconnect_count % 10 == 0)
+            {
+                LOG("Failed to connect to the TCP server (attempt %lu)\n", (unsigned long)tcp_reconnect_count);
+            }
             WiFiState = INIT; // Reinitialize the TCP client in attempt to connect again
             status = false;
         }
         else
         {
+            tcp_reconnect_count = 0;
             LOG("Connection to the TCP server established successfully\n");
         }
     }
@@ -1656,7 +1670,8 @@ static err_t tcp_client_connected_callback(void *arg, struct tcp_pcb *tpcb, err_
     
     /* Set up receive callback */
     tcp_recv(tpcb, tcp_client_recv_callback);
-    
+
+    tcp_reconnect_count = 0;
     LOG("TCP client connected to server\n");
     return ERR_OK;
 }
@@ -1686,23 +1701,28 @@ static void tcp_client_err_callback(void *arg, err_t err)
         clientGlobal->pcb = NULL;
     }
 
-    switch (err) 
+    /* Always log when count==0 (established connection dropped) or on first/every-10th retry.
+     * count==0 because it is reset to 0 on successful connect, so 0 % 10 == 0 catches drops. */
+    if (tcp_reconnect_count == 1 || tcp_reconnect_count % 10 == 0)
     {
-        case ERR_ABRT:
-            LOG("Connection aborted locally\n");
-            break;
-        case ERR_RST:
-            LOG("Connection reset by remote host\n");
-            break;
-        case ERR_CLSD:
-            LOG("Connection closed by remote host\n");
-            break;
-        case ERR_TIMEOUT:
-            LOG("Connection timed out\n");
-            break;
-        default:
-            LOG("TCP Client Error: %d\n", err);
-            break;
+        switch (err)
+        {
+            case ERR_ABRT:
+                LOG("Connection aborted locally\n");
+                break;
+            case ERR_RST:
+                LOG("Connection reset by remote host\n");
+                break;
+            case ERR_CLSD:
+                LOG("Connection closed by remote host\n");
+                break;
+            case ERR_TIMEOUT:
+                LOG("Connection timed out\n");
+                break;
+            default:
+                LOG("TCP Client Error: %d\n", err);
+                break;
+        }
     }
 
     /* Attempt to recover connection by reinitializing the client */
@@ -1729,7 +1749,6 @@ static void tcp_client_cleanup(void)
         {
             vPortFree(clientGlobal);
             clientGlobal = NULL;
-            LOG("TCP client resources cleaned up\n");
         }
         else
         {
