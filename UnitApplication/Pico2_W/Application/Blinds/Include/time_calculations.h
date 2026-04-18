@@ -15,7 +15,7 @@
 /*******************************************************************************/
 #define LATITUDE_SIEROSZEWICE    (51.63394) //in degrees
 #define LONGITUDE_SIEROSZEWICE   (17.96725) //in degrees
-#define TIME_ZONE_PLUS_TO_E      (2)
+#define TIME_ZONE_PLUS_TO_E      (1)        //UTC+1 for Poland in winter, UTC+2 in summer (DST)
 
 #define BCD_TO_DEC 1
 #define DEC_TO_BCD 0
