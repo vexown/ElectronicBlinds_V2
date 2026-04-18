@@ -112,4 +112,33 @@ uint32_t check_current_fw_version(void);
 
 bool validate_app_image(uint32_t addr);
 
+/**
+ * @brief Read the persisted blinds travel-time calibration.
+ *
+ * Reads boot metadata and, if the blinds calibration magic is valid, returns
+ * the stored UP and DOWN travel times. Either output pointer may be NULL if
+ * only one direction is needed.
+ *
+ * @param t_up_ms   Out: full travel time UP in milliseconds.
+ * @param t_down_ms Out: full travel time DOWN in milliseconds.
+ *
+ * @return true if a valid calibration was loaded, false if no calibration
+ *         exists (first boot, post-upgrade, or corrupted metadata).
+ */
+bool read_blinds_calibration(uint32_t *t_up_ms, uint32_t *t_down_ms);
+
+/**
+ * @brief Persist the blinds travel-time calibration.
+ *
+ * Reads existing boot metadata, updates the calibration fields, and writes
+ * it back. Other metadata (active bank, version, etc.) is preserved.
+ *
+ * @param t_up_ms   Full travel time UP in milliseconds.
+ * @param t_down_ms Full travel time DOWN in milliseconds.
+ *
+ * @return true on success, false if the underlying metadata read or write
+ *         failed.
+ */
+bool write_blinds_calibration(uint32_t t_up_ms, uint32_t t_down_ms);
+
 #endif // FLASH_OPERATIONS_H

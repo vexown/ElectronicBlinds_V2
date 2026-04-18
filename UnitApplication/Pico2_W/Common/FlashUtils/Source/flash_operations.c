@@ -160,7 +160,7 @@ uint32_t check_current_fw_version(void)
     uint32_t current_version = 0;
 
     boot_metadata_t current_metadata;
-    if (read_metadata_from_flash(&current_metadata)) 
+    if (read_metadata_from_flash(&current_metadata))
     {
         current_version = current_metadata.version;
     }
@@ -170,4 +170,26 @@ uint32_t check_current_fw_version(void)
     }
 
     return current_version;
+}
+
+bool read_blinds_calibration(uint32_t *t_up_ms, uint32_t *t_down_ms)
+{
+    boot_metadata_t meta;
+    if (!read_metadata_from_flash(&meta))           return false;
+    if (meta.blinds_calib_magic != BLINDS_CALIB_MAGIC) return false;
+
+    if (t_up_ms)   *t_up_ms   = meta.blinds_t_up_ms;
+    if (t_down_ms) *t_down_ms = meta.blinds_t_down_ms;
+    return true;
+}
+
+bool write_blinds_calibration(uint32_t t_up_ms, uint32_t t_down_ms)
+{
+    boot_metadata_t meta;
+    if (!read_metadata_from_flash(&meta)) return false;
+
+    meta.blinds_calib_magic = BLINDS_CALIB_MAGIC;
+    meta.blinds_t_up_ms     = t_up_ms;
+    meta.blinds_t_down_ms   = t_down_ms;
+    return write_metadata_to_flash(&meta);
 }
