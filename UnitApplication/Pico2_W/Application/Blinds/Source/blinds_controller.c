@@ -49,10 +49,6 @@
 #define MANUAL_TIMEOUT_CALLS \
     ((uint32_t)(BLINDS_MANUAL_TIMEOUT_S) * 1000U / (BLINDS_TASK_PERIOD_MS))
 
-/** Number of task calls within which a second tap counts as a double-tap. */
-#define DOUBLE_TAP_WINDOW_CALLS \
-    ((uint32_t)(BLINDS_DOUBLE_TAP_WINDOW_MS) / (BLINDS_TASK_PERIOD_MS))
-
 /*******************************************************************************/
 /*                               DATA TYPES                                    */
 /*******************************************************************************/
@@ -109,15 +105,6 @@ static uint8_t              s_schedule_month      = 0U;
  * press/release event. When it reaches MANUAL_TIMEOUT_CALLS the controller
  * reverts to AUTO. */
 static uint32_t             s_manual_idle_count = 0U;
-
-/* Double-tap full-run state.
- * s_up_tap_countdown / s_down_tap_countdown: decremented every task call after
- *   a single tap; a second tap while non-zero triggers a full run.
- * s_full_run: set during a full run so the motor is not stopped on button
- *   release and the inactivity timer is not advanced. */
-static uint32_t             s_up_tap_countdown   = 0U;
-static uint32_t             s_down_tap_countdown = 0U;
-static bool                 s_full_run           = false;
 
 /* Auto-schedule state.
  * s_auto_target_reached: set when the blinds arrive at the auto target for
@@ -245,7 +232,6 @@ static void handle_limit_switches(bool at_top, bool at_bottom)
         s_state = BLINDS_STATE_IDLE;
         s_mode  = BLINDS_MODE_AUTO; /* Position is known — safe to hand back to auto. */
         s_manual_idle_count   = 0U;
-        s_full_run            = false;
         s_auto_target_reached = true;  /* Don't raise again until day/night flips. */
         s_auto_last_daytime   = is_daytime(now_h);
         LOG("[Blinds] TOP limit reached. Motor stopped.\n");
@@ -256,7 +242,6 @@ static void handle_limit_switches(bool at_top, bool at_bottom)
         s_state = BLINDS_STATE_IDLE;
         s_mode  = BLINDS_MODE_AUTO;
         s_manual_idle_count   = 0U;
-        s_full_run            = false;
         s_auto_target_reached = true;  /* Don't lower again until day/night flips. */
         s_auto_last_daytime   = is_daytime(now_h);
         LOG("[Blinds] BOTTOM limit reached. Motor stopped.\n");
@@ -266,12 +251,10 @@ static void handle_limit_switches(bool at_top, bool at_bottom)
 /**
  * @brief Handle UP/DOWN button presses, holds, and releases.
  *
- * Single tap: motor runs while the button is held; stops on release.
- * Double-tap (second press within BLINDS_DOUBLE_TAP_WINDOW_MS): motor runs to
- *   the corresponding limit switch without needing to hold the button.
- *   Any subsequent press interrupts the full run.
- * After BLINDS_MANUAL_TIMEOUT_S seconds of button inactivity the mode reverts
- *   to AUTO.
+ * A button press puts the controller into MANUAL mode and starts the motor.
+ * The motor runs for as long as the button is held.  On release the motor
+ * stops and the manual-inactivity timer starts.  After BLINDS_MANUAL_TIMEOUT_S
+ * seconds of no button activity the mode reverts to AUTO.
  */
 static void handle_manual_buttons(bool at_top, bool at_bottom)
 {
@@ -280,91 +263,45 @@ static void handle_manual_buttons(bool at_top, bool at_bottom)
     bool up_held      = Debounce_IsHeld(BLINDS_BTN_UP_PIN);
     bool down_held    = Debounce_IsHeld(BLINDS_BTN_DOWN_PIN);
 
-    /* Advance double-tap countdown windows. */
-    if (s_up_tap_countdown   > 0U) s_up_tap_countdown--;
-    if (s_down_tap_countdown > 0U) s_down_tap_countdown--;
-
     /* Any button event resets the inactivity timer. */
     if (up_pressed || down_pressed || up_held || down_held)
     {
         s_manual_idle_count = 0U;
     }
 
-    /* --- Interrupt a full run on any button press -------------------------- */
-    if (s_full_run && (up_pressed || down_pressed))
-    {
-        motor_stop();
-        s_state    = BLINDS_STATE_IDLE;
-        s_full_run = false;
-        s_up_tap_countdown   = 0U;
-        s_down_tap_countdown = 0U;
-        LOG("[Blinds] Full run interrupted by button press.\n");
-        return;
-    }
-
     /* --- UP button pressed ------------------------------------------------- */
     if (up_pressed && !at_top)
     {
-        if (s_up_tap_countdown > 0U)
+        /* Stop any ongoing movement before changing direction. If auto was in
+         * progress, mark its target as reached so it won't restart after the
+         * manual timeout. */
+        if (s_state != BLINDS_STATE_IDLE)
         {
-            /* Double-tap: upgrade to full run — motor keeps going without hold. */
-            s_up_tap_countdown = 0U;
-            s_full_run = true;
-            s_mode     = BLINDS_MODE_MANUAL;
-            s_state    = BLINDS_STATE_MOVING_UP;
-            motor_start_up();
-            LOG("[Blinds] Full run UP triggered.\n");
+            motor_stop();
+            s_auto_target_reached = true;
         }
-        else
-        {
-            /* First tap: normal hold-to-move. Clear the opposite countdown so
-             * a direction change mid-sequence can't accidentally arm a full run. */
-            s_up_tap_countdown   = DOUBLE_TAP_WINDOW_CALLS;
-            s_down_tap_countdown = 0U;
-            if (s_state != BLINDS_STATE_IDLE)
-            {
-                motor_stop();
-                s_auto_target_reached = true;
-            }
-            s_mode  = BLINDS_MODE_MANUAL;
-            s_state = BLINDS_STATE_MOVING_UP;
-            motor_start_up();
-            LOG("[Blinds] Manual UP.\n");
-        }
+        s_mode  = BLINDS_MODE_MANUAL;
+        s_state = BLINDS_STATE_MOVING_UP;
+        motor_start_up();
+        LOG("[Blinds] Manual UP.\n");
     }
 
     /* --- DOWN button pressed ----------------------------------------------- */
     if (down_pressed && !at_bottom)
     {
-        if (s_down_tap_countdown > 0U)
+        if (s_state != BLINDS_STATE_IDLE)
         {
-            /* Double-tap: upgrade to full run. */
-            s_down_tap_countdown = 0U;
-            s_full_run = true;
-            s_mode     = BLINDS_MODE_MANUAL;
-            s_state    = BLINDS_STATE_MOVING_DOWN;
-            motor_start_down();
-            LOG("[Blinds] Full run DOWN triggered.\n");
+            motor_stop();
+            s_auto_target_reached = true;
         }
-        else
-        {
-            /* First tap: normal hold-to-move. Clear the opposite countdown. */
-            s_down_tap_countdown = DOUBLE_TAP_WINDOW_CALLS;
-            s_up_tap_countdown   = 0U;
-            if (s_state != BLINDS_STATE_IDLE)
-            {
-                motor_stop();
-                s_auto_target_reached = true;
-            }
-            s_mode  = BLINDS_MODE_MANUAL;
-            s_state = BLINDS_STATE_MOVING_DOWN;
-            motor_start_down();
-            LOG("[Blinds] Manual DOWN.\n");
-        }
+        s_mode  = BLINDS_MODE_MANUAL;
+        s_state = BLINDS_STATE_MOVING_DOWN;
+        motor_start_down();
+        LOG("[Blinds] Manual DOWN.\n");
     }
 
-    /* --- Stop on button release (hold-to-move only, not during full run) --- */
-    if (s_mode == BLINDS_MODE_MANUAL && s_state != BLINDS_STATE_IDLE && !s_full_run)
+    /* --- Stop when both buttons released (manual mode only) ---------------- */
+    if (s_mode == BLINDS_MODE_MANUAL && s_state != BLINDS_STATE_IDLE)
     {
         if (!up_held && !down_held)
         {
