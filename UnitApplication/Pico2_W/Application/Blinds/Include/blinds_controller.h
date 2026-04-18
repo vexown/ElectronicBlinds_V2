@@ -63,10 +63,13 @@
  *
  * Any motor run (auto, double-tap full-run, or hold-to-move) is bounded by a
  * watchdog: if travel time exceeds BLINDS_TRAVEL_WATCHDOG_PCT of the
- * calibrated travel for the current direction, the motor is force-stopped,
- * the position estimate is invalidated, and the double-tap full-run feature
- * is locked out until the next clean limit hit. This protects the mechanism
- * from a stuck or broken limit switch.
+ * calibrated travel for the current direction, the motor is force-stopped
+ * and the controller latches into a permanent fault state that disables ALL
+ * further motor operation (auto, double-tap, AND hold-to-move) until the
+ * device is power-cycled or reflashed. A watchdog trip means something has
+ * gone seriously wrong (broken limit switch, mechanical jam, miswiring);
+ * resuming automatically could drive the mechanism into the end stop
+ * repeatedly, so manual intervention is required.
  *
  * Travel-time calibration is learned opportunistically: any run that starts
  * at one limit and ends at the opposite limit is timed and (if it differs

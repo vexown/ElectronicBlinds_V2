@@ -130,10 +130,12 @@ static uint32_t             s_up_tap_countdown   = 0U;
 static uint32_t             s_down_tap_countdown = 0U;
 static bool                 s_full_run           = false;
 
-/* Set true after a watchdog trip. Blocks new double-tap full-runs until the
- * next clean limit hit proves the switches are working and re-zeroes
- * position. Manual hold-to-move stays available so the user can recover. */
-static bool                 s_full_run_locked_out = false;
+/* Latched on a watchdog trip. Blocks ALL subsequent motor operation — auto,
+ * double-tap, AND hold-to-move — until power-cycle or reflash. A trip means
+ * something has gone seriously wrong (broken limit, mechanical jam); silently
+ * resuming would risk driving the motor into the end stop again. Reset only
+ * by reboot (this variable lives in RAM). */
+static bool                 s_fault_latched = false;
 
 /* Monotonic task-cycle counter. Used as the time base for watchdog and
  * calibration measurements (each tick = BLINDS_TASK_PERIOD_MS). */
@@ -308,7 +310,6 @@ static void handle_limit_switches(bool at_top, bool at_bottom)
         s_auto_target_reached  = true;  /* Don't raise again until day/night flips. */
         s_auto_last_daytime    = is_daytime(now_h);
         s_position_permille    = 1000U;  /* Re-zero dead reckoning. */
-        s_full_run_locked_out  = false;  /* Switch proven working — re-arm full-run. */
         LOG("[Blinds] TOP limit reached. Motor stopped.\n");
     }
     else if (s_state == BLINDS_STATE_MOVING_DOWN && at_bottom)
@@ -320,7 +321,6 @@ static void handle_limit_switches(bool at_top, bool at_bottom)
         s_auto_target_reached  = true;  /* Don't lower again until day/night flips. */
         s_auto_last_daytime    = is_daytime(now_h);
         s_position_permille    = 0U;
-        s_full_run_locked_out  = false;
         LOG("[Blinds] BOTTOM limit reached. Motor stopped.\n");
     }
 }
@@ -331,13 +331,17 @@ static void handle_limit_switches(bool at_top, bool at_bottom)
  * Single tap: motor runs while the button is held; stops on release.
  * Double-tap (second press within BLINDS_DOUBLE_TAP_WINDOW_MS): motor runs to
  *   the corresponding limit switch without needing to hold the button.
- *   Any subsequent press interrupts the full run. Locked out while
- *   s_full_run_locked_out is set (cleared on the next clean limit hit).
+ *   Any subsequent press interrupts the full run.
+ * After a watchdog trip (s_fault_latched): all input is ignored until reboot.
  * After BLINDS_MANUAL_TIMEOUT_S seconds of button inactivity the mode reverts
  *   to AUTO.
  */
 static void handle_manual_buttons(bool at_top, bool at_bottom)
 {
+    /* Fault latch: once the watchdog has tripped, refuse to drive the motor
+     * again until the device is power-cycled. See motion_check_watchdog(). */
+    if (s_fault_latched) return;
+
     bool up_pressed   = Debounce_Pressed(BLINDS_BTN_UP_PIN);
     bool down_pressed = Debounce_Pressed(BLINDS_BTN_DOWN_PIN);
     bool up_held      = Debounce_IsHeld(BLINDS_BTN_UP_PIN);
@@ -366,7 +370,7 @@ static void handle_manual_buttons(bool at_top, bool at_bottom)
     /* --- UP button pressed ------------------------------------------------- */
     if (up_pressed && !at_top)
     {
-        if (s_up_tap_countdown > 0U && !s_full_run_locked_out)
+        if (s_up_tap_countdown > 0U)
         {
             /* Double-tap: upgrade to full run — motor keeps going without hold. */
             s_up_tap_countdown = 0U;
@@ -378,9 +382,8 @@ static void handle_manual_buttons(bool at_top, bool at_bottom)
         }
         else
         {
-            /* First tap (or post-trip lockout): normal hold-to-move. Clear the
-             * opposite countdown so a direction change can't accidentally arm
-             * a full run. */
+            /* First tap: normal hold-to-move. Clear the opposite countdown so a
+             * direction change can't accidentally arm a full run. */
             s_up_tap_countdown   = DOUBLE_TAP_WINDOW_CALLS;
             s_down_tap_countdown = 0U;
             if (s_state != BLINDS_STATE_IDLE)
@@ -397,7 +400,7 @@ static void handle_manual_buttons(bool at_top, bool at_bottom)
     /* --- DOWN button pressed ----------------------------------------------- */
     if (down_pressed && !at_bottom)
     {
-        if (s_down_tap_countdown > 0U && !s_full_run_locked_out)
+        if (s_down_tap_countdown > 0U)
         {
             /* Double-tap: upgrade to full run. */
             s_down_tap_countdown = 0U;
@@ -481,6 +484,9 @@ static void poll_rtc(void)
  */
 static void handle_auto_control(bool at_top, bool at_bottom)
 {
+    /* Fault latch blocks auto too — otherwise the scheduler would happily
+     * retry against a broken limit switch and retrip indefinitely. */
+    if (s_fault_latched) return;
     if (s_mode != BLINDS_MODE_AUTO) return;
     if (s_state != BLINDS_STATE_IDLE)  return;
 
@@ -660,9 +666,11 @@ static void motion_update_position(void)
 /**
  * @brief Trip the watchdog if the current motion has run longer than
  *        BLINDS_TRAVEL_WATCHDOG_PCT % of the expected travel time. On a trip:
- *        stops the motor, marks position as unknown, and locks out the
- *        double-tap full-run feature until the next clean limit hit
- *        (which proves the switches are working).
+ *        stops the motor, marks position as unknown, and latches
+ *        s_fault_latched, which blocks all further motor operation until the
+ *        device is power-cycled or reflashed. The trip means something has
+ *        gone seriously wrong (broken limit, mechanical jam); resuming
+ *        automatically would risk further mechanical damage.
  */
 static bool motion_check_watchdog(void)
 {
@@ -675,16 +683,13 @@ static bool motion_check_watchdog(void)
 
     Blinds_InternalState dir = s_state;
     stop_motion();
-    s_position_permille    = BLINDS_POSITION_UNKNOWN;
-    s_full_run_locked_out  = true;
-    s_up_tap_countdown     = 0U;
-    s_down_tap_countdown   = 0U;
-    /* Drop back to AUTO so the manual-timeout state machine doesn't sit
-     * idle forever. The next auto attempt will retry — but if the limit
-     * is genuinely broken, the watchdog will trip again. */
-    s_mode = BLINDS_MODE_AUTO;
+    s_position_permille  = BLINDS_POSITION_UNKNOWN;
+    s_fault_latched      = true;
+    s_up_tap_countdown   = 0U;
+    s_down_tap_countdown = 0U;
     LOG("[Blinds] SAFETY: watchdog tripped after %u ms moving %s (expected %u ms). "
-        "Motor stopped. Full-run locked until the next limit hit.\n",
+        "Motor stopped. FAULT LATCHED — all motor operation disabled until "
+        "power-cycle or reflash.\n",
         (unsigned)elapsed_ms,
         (dir == BLINDS_STATE_MOVING_UP) ? "UP" : "DOWN",
         (unsigned)expected_ms);
