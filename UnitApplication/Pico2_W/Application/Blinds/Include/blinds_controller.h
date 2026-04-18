@@ -54,6 +54,10 @@
  * button is held (or until the corresponding limit switch fires).
  * After BLINDS_MANUAL_TIMEOUT_S seconds of button inactivity the controller
  * returns to automatic mode.
+ *
+ * Double-tapping UP or DOWN (two presses within BLINDS_DOUBLE_TAP_WINDOW_MS)
+ * starts a full run to the corresponding limit switch without requiring the
+ * button to be held.  Any subsequent button press interrupts the run.
  */
 
 #ifndef BLINDS_CONTROLLER_H
@@ -114,6 +118,14 @@
 
 /** @brief Recommended FreeRTOS task period in milliseconds. */
 #define BLINDS_TASK_PERIOD_MS       50U
+
+/**
+ * @brief Maximum gap (ms) between two taps to be recognised as a double-tap.
+ *
+ * Double-tapping UP or DOWN starts a full run to the corresponding limit
+ * without requiring the button to be held.  A single subsequent tap interrupts.
+ */
+#define BLINDS_DOUBLE_TAP_WINDOW_MS 500U
 
 /**
  * @brief Seconds of button inactivity before automatic mode resumes.
