@@ -170,7 +170,7 @@
  * calibrated value (e.g. 120 means stop after 1.20 × expected travel).
  * Lower = stricter protection but more false positives from motor variance.
  */
-#define BLINDS_TRAVEL_WATCHDOG_PCT  120U
+#define BLINDS_TRAVEL_WATCHDOG_PCT  110U
 
 /**
  * @brief Travel time (ms) the watchdog assumes when no calibration exists.
