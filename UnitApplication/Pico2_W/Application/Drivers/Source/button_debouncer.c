@@ -109,6 +109,8 @@ static bool debounce_timer_cb(struct repeating_timer *t)
 
 Debounce_Status Debounce_Init(void)
 {
+    if (s_initialized) return DEBOUNCE_OK;
+
     for (uint8_t i = 0; i < DEBOUNCE_MAX_BUTTONS; i++)
     {
         s_buttons[i].in_use = false;
