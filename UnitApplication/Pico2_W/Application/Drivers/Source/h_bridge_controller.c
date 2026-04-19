@@ -13,6 +13,8 @@ static bool s_initialized = false;
 
 HBridge_Status HBridge_Init(void)
 {
+    if (s_initialized) return HBRIDGE_OK;
+
     /* Configure enable pins as GPIO outputs (default LOW = disabled) */
     if (GPIO_Init(HBRIDGE_L_EN_PIN, GPIO_OUTPUT, GPIO_PULL_NONE) != GPIO_OK) return HBRIDGE_ERROR_GPIO;
     if (GPIO_Init(HBRIDGE_R_EN_PIN, GPIO_OUTPUT, GPIO_PULL_NONE) != GPIO_OK) return HBRIDGE_ERROR_GPIO;
