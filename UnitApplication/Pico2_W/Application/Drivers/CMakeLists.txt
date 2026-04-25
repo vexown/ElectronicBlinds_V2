@@ -14,6 +14,7 @@ set(DRIVERS_SOURCE_FILES
     ${CMAKE_CURRENT_SOURCE_DIR}/Source/AT24C32_HAL.c
     ${CMAKE_CURRENT_SOURCE_DIR}/Source/h_bridge_controller.c
     ${CMAKE_CURRENT_SOURCE_DIR}/Source/button_debouncer.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/Source/VEML7700.c
     )
 
 # Define the path to the include directory for Drivers
