@@ -587,7 +587,7 @@ static void handle_sun_control(bool at_top, bool at_bottom)
                 start_motion(BLINDS_STATE_MOVING_DOWN, at_top, at_bottom);
                 LOG("[Sun] %.0f lx >= threshold. Lowering to %u/1000. "
                     "Saved position: %u.\n",
-                    s_sun_lux,
+                    (double)s_sun_lux,
                     (unsigned)BLINDS_SUN_HALFWAY_PERMILLE,
                     (unsigned)s_sun_saved_position);
             }
@@ -626,7 +626,7 @@ static void handle_sun_control(bool at_top, bool at_bottom)
                     s_sun_state = SUN_STATE_RETURNING;
                     start_motion(BLINDS_STATE_MOVING_UP, at_top, at_bottom);
                     LOG("[Sun] %.0f lx below threshold. Returning to %u/1000.\n",
-                        s_sun_lux, (unsigned)s_sun_saved_position);
+                        (double)s_sun_lux, (unsigned)s_sun_saved_position);
                 }
                 else
                 {
