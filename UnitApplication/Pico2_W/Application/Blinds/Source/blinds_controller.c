@@ -38,6 +38,7 @@
 #include "button_debouncer.h"
 #include "h_bridge_controller.h"
 #include "DS3231_HAL.h"
+#include "VEML7700.h"
 #include "time_calculations.h"
 #include "flash_operations.h"
 #include "Common.h"
@@ -71,6 +72,15 @@ typedef enum
     BLINDS_MODE_MANUAL,
 } Blinds_Mode;
 
+typedef enum
+{
+    SUN_STATE_IDLE = 0,   /* Monitoring lux; no event active.                   */
+    SUN_STATE_GOING_DOWN, /* Motor moving to BLINDS_SUN_HALFWAY_PERMILLE.        */
+    SUN_STATE_AT_HALFWAY, /* Holding at halfway; waiting for lux to drop.        */
+    SUN_STATE_RETURNING,  /* Motor moving back to the saved position.            */
+    SUN_STATE_CANCELLED,  /* Event interrupted; waiting for lux to clear.        */
+} Sun_State;
+
 /*******************************************************************************/
 /*                        STATIC FUNCTION DECLARATIONS                         */
 /*******************************************************************************/
@@ -83,6 +93,7 @@ static float        rtc_decimal_hours(const DS3231_DateTime *dt);
 static void         recalculate_sun_schedule(const DS3231_DateTime *dt);
 static void         handle_limit_switches(bool at_top, bool at_bottom);
 static void         handle_manual_buttons(bool at_top, bool at_bottom);
+static void         handle_sun_control(bool at_top, bool at_bottom);
 static void         handle_auto_control(bool at_top, bool at_bottom);
 static void         poll_rtc(void);
 
@@ -170,6 +181,20 @@ static uint16_t             s_position_permille  = BLINDS_POSITION_UNKNOWN;
 static bool                 s_auto_target_reached = false;
 static bool                 s_auto_last_daytime   = false;
 
+/* Sun automation state.
+ * s_sun_state:          current phase of the sun-event state machine.
+ * s_sun_saved_position: position at the moment the sun event was triggered;
+ *                        the blinds return here when lux drops.
+ * s_sun_poll_count:     call counter for throttling VEML7700 reads.
+ * s_sun_lux:            most recent valid lux reading (0.0 on init, so the
+ *                        event cannot fire until the first successful poll).
+ * s_sun_sensor_ok:      false if VEML7700_Init failed — disables sun logic. */
+static Sun_State            s_sun_state          = SUN_STATE_IDLE;
+static uint16_t             s_sun_saved_position = BLINDS_POSITION_UNKNOWN;
+static uint32_t             s_sun_poll_count     = 0U;
+static float                s_sun_lux            = 0.0f;
+static bool                 s_sun_sensor_ok      = false;
+
 /*******************************************************************************/
 /*                          GLOBAL FUNCTION DEFINITIONS                        */
 /*******************************************************************************/
@@ -249,7 +274,19 @@ Blinds_Status Blinds_Init(void)
     s_auto_last_daytime   = !is_daytime(rtc_decimal_hours(&s_rtc_snapshot)); /* force mismatch */
     s_auto_target_reached = false;
 
-    /* --- 4. Travel-time calibration ---------------------------------------- */
+    /* --- 4. VEML7700 ambient light sensor (non-fatal — sun automation is
+     *        disabled if the sensor is absent or fails to respond). ----------- */
+    if (VEML7700_Init() == VEML7700_OK)
+    {
+        s_sun_sensor_ok = true;
+        LOG("[Blinds] VEML7700 ambient light sensor ready.\n");
+    }
+    else
+    {
+        LOG("[Blinds] WARNING: VEML7700 init failed. Sun automation disabled.\n");
+    }
+
+    /* --- 5. Travel-time calibration ---------------------------------------- */
     if (read_blinds_calibration(&s_travel_up_ms, &s_travel_down_ms))
     {
         LOG("[Blinds] Calibration loaded: T_up=%u ms, T_down=%u ms.\n",
@@ -281,12 +318,14 @@ void Blinds_MainFunction(void)
      *     this cycle — e.g. broken limit switch).
      *  2. Safety stop at limits.
      *  3. Manual button commands (incl. double-tap full-run gesture).
-     *  4. Auto schedule (only when manual is idle).
-     *  5. Update dead-reckoned position estimate. */
+     *  4. Sun automation (lux-triggered half-position event).
+     *  5. Auto schedule (only when manual is idle and no sun event is active).
+     *  6. Update dead-reckoned position estimate. */
     (void)motion_check_watchdog();
     handle_limit_switches(at_top, at_bottom);
     handle_manual_buttons(at_top, at_bottom);
     poll_rtc();
+    handle_sun_control(at_top, at_bottom);
     handle_auto_control(at_top, at_bottom);
     motion_update_position();
 }
@@ -478,6 +517,155 @@ static void poll_rtc(void)
 }
 
 /**
+ * @brief Lux-triggered sun-position automation.
+ *
+ * When the VEML7700 reads above BLINDS_SUN_LUX_THRESHOLD the blinds are
+ * lowered to BLINDS_SUN_HALFWAY_PERMILLE (if they are currently above it).
+ * The prior position is saved and restored once lux falls below
+ * (BLINDS_SUN_LUX_THRESHOLD - BLINDS_SUN_LUX_HYSTERESIS).
+ *
+ * The event is one-shot: any manual button activity while an event is in
+ * progress transitions to SUN_STATE_CANCELLED, which suppresses re-arming
+ * until lux drops below the hysteresis floor and then rises again.
+ *
+ * State machine:
+ *   IDLE → (lux high, above halfway, auto+idle) → GOING_DOWN
+ *   GOING_DOWN → (position reached halfway)     → AT_HALFWAY
+ *   GOING_DOWN → (manual interruption)          → CANCELLED
+ *   AT_HALFWAY → (lux low)                      → RETURNING
+ *   AT_HALFWAY → (manual interruption)          → CANCELLED
+ *   RETURNING  → (position reached saved)       → IDLE
+ *   RETURNING  → (manual interruption)          → CANCELLED
+ *   CANCELLED  → (lux low)                      → IDLE  (re-armed)
+ */
+static void handle_sun_control(bool at_top, bool at_bottom)
+{
+    if (!s_sun_sensor_ok) return;
+    if (s_fault_latched)  return;
+
+    /* Throttled lux poll — keep s_sun_lux up-to-date regardless of state. */
+    s_sun_poll_count++;
+    if (s_sun_poll_count >= BLINDS_SUN_POLL_CALLS)
+    {
+        s_sun_poll_count = 0U;
+        float lux;
+        if (VEML7700_GetLuxCorrected(&lux) == VEML7700_OK)
+        {
+            s_sun_lux = lux;
+        }
+    }
+
+    bool lux_high = (s_sun_lux >= BLINDS_SUN_LUX_THRESHOLD);
+    bool lux_low  = (s_sun_lux <  (BLINDS_SUN_LUX_THRESHOLD - BLINDS_SUN_LUX_HYSTERESIS));
+
+    /* The time-based auto schedule must always win at day/night boundaries.
+     * Cancel any active event when night begins so the sunset lowering is
+     * never blocked or delayed by a lingering sun event. */
+    if (s_sun_state != SUN_STATE_IDLE && s_sun_state != SUN_STATE_CANCELLED)
+    {
+        if (!is_daytime(rtc_decimal_hours(&s_rtc_snapshot)))
+        {
+            if (s_state != BLINDS_STATE_IDLE) stop_motion();
+            s_sun_saved_position = BLINDS_POSITION_UNKNOWN;
+            s_sun_state          = SUN_STATE_IDLE;
+            LOG("[Sun] Night began. Sun event cleared; auto schedule takes over.\n");
+            return;
+        }
+    }
+
+    switch (s_sun_state)
+    {
+        case SUN_STATE_IDLE:
+            if (lux_high
+                && s_mode  == BLINDS_MODE_AUTO
+                && s_state == BLINDS_STATE_IDLE
+                && s_position_permille != BLINDS_POSITION_UNKNOWN
+                && s_position_permille >  BLINDS_SUN_HALFWAY_PERMILLE)
+            {
+                s_sun_saved_position = s_position_permille;
+                s_sun_state          = SUN_STATE_GOING_DOWN;
+                start_motion(BLINDS_STATE_MOVING_DOWN, at_top, at_bottom);
+                LOG("[Sun] %.0f lx >= threshold. Lowering to %u/1000. "
+                    "Saved position: %u.\n",
+                    s_sun_lux,
+                    (unsigned)BLINDS_SUN_HALFWAY_PERMILLE,
+                    (unsigned)s_sun_saved_position);
+            }
+            break;
+
+        case SUN_STATE_GOING_DOWN:
+            if (s_mode == BLINDS_MODE_MANUAL)
+            {
+                /* Motor already stopped by handle_manual_buttons(). */
+                s_sun_state = SUN_STATE_CANCELLED;
+                LOG("[Sun] Lowering interrupted by manual input. Event cancelled.\n");
+                break;
+            }
+            if (s_position_permille != BLINDS_POSITION_UNKNOWN
+                && s_position_permille <= BLINDS_SUN_HALFWAY_PERMILLE)
+            {
+                stop_motion();
+                s_sun_state = SUN_STATE_AT_HALFWAY;
+                LOG("[Sun] Reached halfway (%u/1000). Waiting for lux to drop.\n",
+                    (unsigned)s_position_permille);
+            }
+            break;
+
+        case SUN_STATE_AT_HALFWAY:
+            if (s_mode == BLINDS_MODE_MANUAL)
+            {
+                s_sun_state = SUN_STATE_CANCELLED;
+                LOG("[Sun] Manual input while at halfway. Event cancelled.\n");
+                break;
+            }
+            if (lux_low)
+            {
+                if (s_sun_saved_position != BLINDS_POSITION_UNKNOWN
+                    && s_sun_saved_position > BLINDS_SUN_HALFWAY_PERMILLE)
+                {
+                    s_sun_state = SUN_STATE_RETURNING;
+                    start_motion(BLINDS_STATE_MOVING_UP, at_top, at_bottom);
+                    LOG("[Sun] %.0f lx below threshold. Returning to %u/1000.\n",
+                        s_sun_lux, (unsigned)s_sun_saved_position);
+                }
+                else
+                {
+                    s_sun_state          = SUN_STATE_IDLE;
+                    s_sun_saved_position = BLINDS_POSITION_UNKNOWN;
+                    LOG("[Sun] Lux dropped. No valid saved position. Event complete.\n");
+                }
+            }
+            break;
+
+        case SUN_STATE_RETURNING:
+            if (s_mode == BLINDS_MODE_MANUAL)
+            {
+                s_sun_state = SUN_STATE_CANCELLED;
+                LOG("[Sun] Return interrupted by manual input. Event cancelled.\n");
+                break;
+            }
+            if (at_top
+                || (s_position_permille != BLINDS_POSITION_UNKNOWN
+                    && s_position_permille >= s_sun_saved_position))
+            {
+                stop_motion();
+                s_sun_saved_position = BLINDS_POSITION_UNKNOWN;
+                s_sun_state          = SUN_STATE_IDLE;
+                LOG("[Sun] Returned to saved position. Event complete.\n");
+            }
+            break;
+
+        case SUN_STATE_CANCELLED:
+            if (lux_low)
+            {
+                s_sun_state = SUN_STATE_IDLE;
+                LOG("[Sun] Lux cleared after cancellation. Re-armed.\n");
+            }
+            break;
+    }
+}
+
+/**
  * @brief Drive the motor toward the target position dictated by the schedule.
  *
  * Only acts when in AUTO mode and the motor is already idle.
@@ -491,6 +679,10 @@ static void handle_auto_control(bool at_top, bool at_bottom)
     if (s_fault_latched) return;
     if (s_mode != BLINDS_MODE_AUTO) return;
     if (s_state != BLINDS_STATE_IDLE)  return;
+
+    /* Sun automation takes priority during an active event — prevent auto from
+     * fighting the sun position or lifting the blinds while they are at halfway. */
+    if (s_sun_state != SUN_STATE_IDLE && s_sun_state != SUN_STATE_CANCELLED) return;
 
     float now_h  = rtc_decimal_hours(&s_rtc_snapshot);
     bool  daytime = is_daytime(now_h);

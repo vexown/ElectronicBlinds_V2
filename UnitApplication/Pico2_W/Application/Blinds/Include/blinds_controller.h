@@ -202,6 +202,43 @@
 #define BLINDS_POSITION_UNKNOWN     0xFFFFU
 
 /*******************************************************************************/
+/*                           SUN AUTOMATION CONSTANTS                          */
+/*******************************************************************************/
+
+/**
+ * @brief Lux level (inclusive) that triggers the sun-lowering event.
+ *
+ * When the VEML7700 reads at or above this value the blinds are automatically
+ * lowered to BLINDS_SUN_HALFWAY_PERMILLE. A value around 50 000 lx represents
+ * intense direct sunlight through a window.
+ */
+#define BLINDS_SUN_LUX_THRESHOLD       50000.0f
+
+/**
+ * @brief Hysteresis band (lux) below the threshold for the return trip.
+ *
+ * The blinds return to their saved position only when lux drops below
+ * (BLINDS_SUN_LUX_THRESHOLD - BLINDS_SUN_LUX_HYSTERESIS). Prevents
+ * rapid toggling when illuminance hovers near the trigger point.
+ */
+#define BLINDS_SUN_LUX_HYSTERESIS      10000.0f
+
+/**
+ * @brief Sun-position target as a per-mille fraction of the travel range.
+ *
+ * 0 = fully closed (bottom limit), 1000 = fully open (top limit).
+ * 500 means half-way. The event fires only when the current position is
+ * ABOVE this value; if the blinds are already at or below it nothing happens.
+ */
+#define BLINDS_SUN_HALFWAY_PERMILLE    500U
+
+/**
+ * @brief How often (in task calls) to poll the VEML7700 for a lux reading.
+ * 10 × 50 ms = 500 ms — well above the 100 ms integration time.
+ */
+#define BLINDS_SUN_POLL_CALLS          ((uint32_t)(500U) / BLINDS_TASK_PERIOD_MS)
+
+/*******************************************************************************/
 /*                                 STATUS CODES                                */
 /*******************************************************************************/
 
