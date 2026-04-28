@@ -276,14 +276,16 @@ Blinds_Status Blinds_Init(void)
 
     /* --- 4. VEML7700 ambient light sensor (non-fatal — sun automation is
      *        disabled if the sensor is absent or fails to respond). ----------- */
-    if (VEML7700_Init() == VEML7700_OK)
+    VEML7700_Status veml_status = VEML7700_Init();
+    if (veml_status == VEML7700_OK)
     {
         s_sun_sensor_ok = true;
         LOG("[Blinds] VEML7700 ambient light sensor ready.\n");
     }
     else
     {
-        LOG("[Blinds] WARNING: VEML7700 init failed. Sun automation disabled.\n");
+        LOG("[Blinds] WARNING: VEML7700 init failed (status=%d). Sun automation disabled.\n",
+            (int)veml_status);
     }
 
     /* --- 5. Travel-time calibration ---------------------------------------- */
