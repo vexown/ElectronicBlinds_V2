@@ -177,11 +177,12 @@ typedef enum
  */
 typedef enum
 {
-    VEML7700_OK = 0,          /**< Operation completed successfully. */
-    VEML7700_ERROR_INIT,      /**< I2C peripheral initialisation failed. */
-    VEML7700_ERROR_READ,      /**< I2C read transaction failed. */
-    VEML7700_ERROR_WRITE,     /**< I2C write transaction failed. */
-    VEML7700_ERROR_NO_DEVICE  /**< VEML7700 did not acknowledge its I2C address. */
+    VEML7700_OK = 0,           /**< Operation completed successfully. */
+    VEML7700_ERROR_INIT,       /**< I2C peripheral initialisation failed. */
+    VEML7700_ERROR_READ,       /**< I2C read transaction failed. */
+    VEML7700_ERROR_WRITE,      /**< I2C write transaction failed. */
+    VEML7700_ERROR_NO_DEVICE,  /**< VEML7700 did not acknowledge its I2C address. */
+    VEML7700_ERROR_WRONG_ID    /**< Device at 0x10 returned unexpected device ID. */
 } VEML7700_Status;
 
 /**

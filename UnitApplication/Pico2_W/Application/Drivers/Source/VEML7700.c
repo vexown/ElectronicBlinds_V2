@@ -85,7 +85,7 @@ VEML7700_Status VEML7700_Init(void)
     }
     if ((id & 0xFF) != VEML7700_DEVICE_ID)
     {
-        return VEML7700_ERROR_NO_DEVICE;
+        return VEML7700_ERROR_WRONG_ID;
     }
 
     /* Power on with default settings: gain x1, IT 100 ms, persistence 1, interrupts off */

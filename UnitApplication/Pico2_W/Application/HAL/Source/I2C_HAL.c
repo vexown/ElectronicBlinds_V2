@@ -19,6 +19,11 @@
 #define I2C_SEND_RESTART    true   // Retains control of the bus and sends a Restart instead of a Stop allowing to send more data right away
 
 /*******************************************************************************/
+/*                             STATIC VARIABLES                                */
+/*******************************************************************************/
+static bool s_initialized[2] = {false, false};
+
+/*******************************************************************************/
 /*                        STATIC FUNCTION DEFINITIONS                          */
 /*******************************************************************************/
 
@@ -86,19 +91,22 @@ I2C_Status I2C_Init(const I2C_Config* config)
 
     if (!is_valid_i2c_pins(config->instance, config->sda_pin, config->scl_pin)) return I2C_ERROR_INVALID_PINS;
 
+    if (s_initialized[config->instance]) return I2C_OK;
+
     i2c_inst_t* i2c = get_i2c_inst(config->instance);
 
     /* Initialize I2C peripheral */
     (void)i2c_init(i2c, config->speed_hz); //returns the actual set baudrate, idc
-    
+
     /* Set up GPIO pins for I2C */
     gpio_set_function(config->sda_pin, GPIO_FUNC_I2C);
     gpio_set_function(config->scl_pin, GPIO_FUNC_I2C);
-    
+
     /* Enable pull-ups */
     gpio_pull_up(config->sda_pin);
     gpio_pull_up(config->scl_pin);
 
+    s_initialized[config->instance] = true; // this works because the I2C instances are enumerated from 0 to 1, so we can use the instance value as an index in the array
     return I2C_OK;
 }
 
@@ -149,8 +157,8 @@ I2C_Status I2C_ReadByte(I2C_Instance instance, uint8_t dev_addr, uint8_t reg_add
        This step tells the slave device which register (or memory address) we want to read from.
        The master sends the register address to the slave, and the slave will know where to
        fetch the data from when the next read command is sent. */
-    int status = i2c_write_timeout_us(i2c, dev_addr, buffer, sizeof(buffer), I2C_SEND_STOP, I2C_TIMEOUT_US);
-    
+    int status = i2c_write_timeout_us(i2c, dev_addr, buffer, sizeof(buffer), I2C_SEND_RESTART, I2C_TIMEOUT_US);
+
     if (status == PICO_ERROR_GENERIC) {
         return I2C_ERROR_WRITE_FAILED;
     }
@@ -228,8 +236,8 @@ I2C_Status I2C_ReadMultiple(I2C_Instance instance, uint8_t dev_addr, uint8_t reg
     /* Step 1: Write the register address to the device
        This tells the slave which register to start reading from. 
        After this, the device will automatically increment the register address. */
-    int status = i2c_write_timeout_us(i2c, dev_addr, buffer, sizeof(buffer), I2C_SEND_STOP, I2C_TIMEOUT_US);
-    
+    int status = i2c_write_timeout_us(i2c, dev_addr, buffer, sizeof(buffer), I2C_SEND_RESTART, I2C_TIMEOUT_US);
+
     if (status == PICO_ERROR_GENERIC) {
         return I2C_ERROR_WRITE_FAILED;
     }
