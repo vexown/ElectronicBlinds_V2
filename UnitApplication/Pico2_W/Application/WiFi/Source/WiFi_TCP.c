@@ -696,27 +696,30 @@ bool start_TCP_client(const char *host, uint16_t port)
     {
         clientGlobal = tcp_client_init();
 
+        tcp_reconnect_count++;
+
         if (clientGlobal == NULL)
         {
             LOG("TCP client initialization failed\n");
             status = false;
         }
-
-        tcp_reconnect_count++;
-        bool connected = tcp_client_connect(host, port);
-        if (!connected)
-        {
-            if (tcp_reconnect_count == 1 || tcp_reconnect_count % 10 == 0)
-            {
-                LOG("Failed to connect to the TCP server (attempt %lu)\n", (unsigned long)tcp_reconnect_count);
-            }
-            WiFiState = INIT; // Reinitialize the TCP client in attempt to connect again
-            status = false;
-        }
         else
         {
-            tcp_reconnect_count = 0;
-            LOG("Connection to the TCP server established successfully\n");
+            bool connected = tcp_client_connect(host, port);
+            if (!connected)
+            {
+                if (tcp_reconnect_count == 1 || tcp_reconnect_count % 10 == 0)
+                {
+                    LOG("Failed to connect to the TCP server (attempt %lu)\n", (unsigned long)tcp_reconnect_count);
+                }
+                WiFiState = INIT; // Reinitialize the TCP client in attempt to connect again
+                status = false;
+            }
+            else
+            {
+                tcp_reconnect_count = 0;
+                LOG("Connection to the TCP server established successfully\n");
+            }
         }
     }
 
@@ -1218,10 +1221,16 @@ static err_t tcp_server_send(const char *data, uint16_t length)
  *                   successful or NULL if initialization or connection 
  *                   fails.
  */
-static TCP_Client_t* tcp_client_init(void) 
+static TCP_Client_t* tcp_client_init(void)
 {
     /* Allocate memory for the TCP client structure on the heap */
     TCP_Client_t *client = (TCP_Client_t*)pvPortCalloc(1, sizeof(TCP_Client_t));
+
+    if (client == NULL)
+    {
+        LOG("Failed to allocate client structure\n");
+        return NULL;
+    }
 
     /* Set flow control parameters */
     client->flow_control_threshold = (TCP_RECV_BUFFER_SIZE / 2 ); // 50% of the buffer size
@@ -1230,36 +1239,32 @@ static TCP_Client_t* tcp_client_init(void)
     /* Create a binary semaphore for signaling data availability */
     tcp_data_available_semaphore = xSemaphoreCreateBinary();
 
-    if (client == NULL) 
-    {
-        LOG("Failed to allocate client structure\n");
-    }
-    else if (tcp_data_available_semaphore == NULL) 
+    if (tcp_data_available_semaphore == NULL)
     {
         LOG("Failed to create semaphore\n");
         vPortFree(client);
-        client = NULL;
+        return NULL;
     }
-    else
+
+    /* Create new TCP PCB (Protocol Control Block) for the client */
+    /* PCB is a central data structure for managing an active TCP connection. Each TCP connection is represented by one tcp_pcb instance,
+     * which contains all the necessary information. This structure is manipulated by the TCP stack to implement the protocol according to
+     * RFC 793 and its extensions. It maintains all necessary state to handle the TCP connection lifecycle from establishment to termination. */
+    client->pcb = tcp_new();
+    if (client->pcb == NULL)
     {
-        /* Create new TCP PCB (Protocol Control Block) for the client */
-        /* PCB is a central data structure for managing an active TCP connection. Each TCP connection is represented by one tcp_pcb instance, 
-         * which contains all the necessary information. This structure is manipulated by the TCP stack to implement the protocol according to 
-         * RFC 793 and its extensions. It maintains all necessary state to handle the TCP connection lifecycle from establishment to termination. */
-        client->pcb = tcp_new();
-        if (client->pcb == NULL) 
-        {
-            LOG("Failed to create TCP PCB\n");
-            vPortFree(client);
-            return NULL;
-        }
-
-        /* Set client structure as an argument for callback functions (meaning that the callbacks will have access to the client structure) */
-        tcp_arg(client->pcb, client);
-
-        /* Set up error callback */
-        tcp_err(client->pcb, tcp_client_err_callback);
+        LOG("Failed to create TCP PCB\n");
+        vSemaphoreDelete(tcp_data_available_semaphore);
+        tcp_data_available_semaphore = NULL;
+        vPortFree(client);
+        return NULL;
     }
+
+    /* Set client structure as an argument for callback functions (meaning that the callbacks will have access to the client structure) */
+    tcp_arg(client->pcb, client);
+
+    /* Set up error callback */
+    tcp_err(client->pcb, tcp_client_err_callback);
 
     return client;
 }
@@ -1744,18 +1749,14 @@ static void tcp_client_cleanup(void)
     if (clientGlobal != NULL)
     {
         clientGlobal->pcb = NULL;
-        /* PCB is already freed in tcp_close() function, but we do need to free the clientGlobal structure manually */
-        if(clientGlobal != NULL)
-        {
-            vPortFree(clientGlobal);
-            clientGlobal = NULL;
-        }
-        else
-        {
-            LOG("TCP client already deallocated\n");
-        }
+        vPortFree(clientGlobal);
+        clientGlobal = NULL;
+    }
 
-        /* Setting clientGlobal->is_closing=false is not done here since we are deallocating the clientGlobal structure */
+    if (tcp_data_available_semaphore != NULL)
+    {
+        vSemaphoreDelete(tcp_data_available_semaphore);
+        tcp_data_available_semaphore = NULL;
     }
 }
 
