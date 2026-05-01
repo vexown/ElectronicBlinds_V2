@@ -237,6 +237,17 @@
  */
 #define BLINDS_SUN_POLL_CALLS          ((uint32_t)(500U) / BLINDS_TASK_PERIOD_MS)
 
+/**
+ * @brief Minimum time (s) the lux reading must remain continuously above the
+ *        high threshold (or below the hysteresis floor) before sun automation
+ *        acts on it.
+ *
+ * Prevents transient obstructions (passing cloud, brief shadow, sensor noise)
+ * from triggering unnecessary blind movements. A value of 60 means the
+ * condition must hold for a full minute of successive VEML7700 polls.
+ */
+#define BLINDS_SUN_STABLE_TIME_S       60U
+
 /*******************************************************************************/
 /*                                 STATUS CODES                                */
 /*******************************************************************************/

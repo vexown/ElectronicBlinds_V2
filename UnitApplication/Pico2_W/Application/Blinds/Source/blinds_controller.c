@@ -55,6 +55,13 @@
 #define DOUBLE_TAP_WINDOW_CALLS \
     ((uint32_t)(BLINDS_DOUBLE_TAP_WINDOW_MS) / (BLINDS_TASK_PERIOD_MS))
 
+/** Number of consecutive VEML7700 polls that must show the same lux condition
+ *  (high or low) before sun automation fires. Each poll = BLINDS_SUN_POLL_CALLS
+ *  × BLINDS_TASK_PERIOD_MS ms. */
+#define SUN_STABLE_POLLS \
+    ((uint32_t)(BLINDS_SUN_STABLE_TIME_S) * 1000U / \
+     ((uint32_t)BLINDS_SUN_POLL_CALLS * (uint32_t)BLINDS_TASK_PERIOD_MS))
+
 /*******************************************************************************/
 /*                               DATA TYPES                                    */
 /*******************************************************************************/
@@ -96,6 +103,15 @@ static void         handle_manual_buttons(bool at_top, bool at_bottom);
 static void         handle_sun_control(bool at_top, bool at_bottom);
 static void         handle_auto_control(bool at_top, bool at_bottom);
 static void         poll_rtc(void);
+
+/* Sun-control helpers — one per state plus shared utilities. */
+static void         sun_poll_lux(void);
+static bool         sun_preempt_for_night(void);
+static void         sun_idle(bool lux_high, bool at_top, bool at_bottom);
+static void         sun_going_down(void);
+static void         sun_at_halfway(bool lux_low, bool at_top, bool at_bottom);
+static void         sun_returning(bool at_top);
+static void         sun_cancelled(bool lux_low);
 
 /* Motion bookkeeping — wrap motor_start_up/down so every motion is timed,
  * watchdogged, and contributes to position tracking / calibration. */
@@ -194,6 +210,8 @@ static uint16_t             s_sun_saved_position = BLINDS_POSITION_UNKNOWN;
 static uint32_t             s_sun_poll_count     = 0U;
 static float                s_sun_lux            = 0.0f;
 static bool                 s_sun_sensor_ok      = false;
+static uint32_t             s_lux_high_stable_polls = 0U; /* Consecutive polls at/above threshold. */
+static uint32_t             s_lux_low_stable_polls  = 0U; /* Consecutive polls below hysteresis floor. */
 
 /*******************************************************************************/
 /*                          GLOBAL FUNCTION DEFINITIONS                        */
@@ -561,125 +579,165 @@ static void handle_sun_control(bool at_top, bool at_bottom)
     if (!s_sun_sensor_ok) return;
     if (s_fault_latched)  return;
 
-    /* Throttled lux poll — keep s_sun_lux up-to-date regardless of state. */
-    s_sun_poll_count++;
-    if (s_sun_poll_count >= BLINDS_SUN_POLL_CALLS)
-    {
-        s_sun_poll_count = 0U;
-        float lux;
-        if (VEML7700_GetLuxCorrected(&lux) == VEML7700_OK)
-        {
-            s_sun_lux = lux;
-        }
-    }
+    sun_poll_lux();
 
-    bool lux_high = (s_sun_lux >= BLINDS_SUN_LUX_THRESHOLD);
-    bool lux_low  = (s_sun_lux <  (BLINDS_SUN_LUX_THRESHOLD - BLINDS_SUN_LUX_HYSTERESIS));
+    bool lux_high = (s_sun_lux >= BLINDS_SUN_LUX_THRESHOLD)
+                    && (s_lux_high_stable_polls >= SUN_STABLE_POLLS);
+    bool lux_low  = (s_sun_lux <  (BLINDS_SUN_LUX_THRESHOLD - BLINDS_SUN_LUX_HYSTERESIS))
+                    && (s_lux_low_stable_polls  >= SUN_STABLE_POLLS);
 
-    /* The time-based auto schedule must always win at day/night boundaries.
-     * Cancel any active event when night begins so the sunset lowering is
-     * never blocked or delayed by a lingering sun event. */
-    if (s_sun_state != SUN_STATE_IDLE && s_sun_state != SUN_STATE_CANCELLED)
-    {
-        if (!is_daytime(rtc_decimal_hours(&s_rtc_snapshot)))
-        {
-            if (s_state != BLINDS_STATE_IDLE) stop_motion();
-            s_sun_saved_position = BLINDS_POSITION_UNKNOWN;
-            s_sun_state          = SUN_STATE_IDLE;
-            LOG("[Sun] Night began. Sun event cleared; auto schedule takes over.\n");
-            return;
-        }
-    }
+    if (sun_preempt_for_night()) return;
 
     switch (s_sun_state)
     {
-        case SUN_STATE_IDLE:
-            if (lux_high
-                && s_mode  == BLINDS_MODE_AUTO
-                && s_state == BLINDS_STATE_IDLE
-                && s_position_permille != BLINDS_POSITION_UNKNOWN
-                && s_position_permille >  BLINDS_SUN_HALFWAY_PERMILLE)
-            {
-                s_sun_saved_position = s_position_permille;
-                s_sun_state          = SUN_STATE_GOING_DOWN;
-                start_motion(BLINDS_STATE_MOVING_DOWN, at_top, at_bottom);
-                LOG("[Sun] %.0f lx >= threshold. Lowering to %u/1000. "
-                    "Saved position: %u.\n",
-                    (double)s_sun_lux,
-                    (unsigned)BLINDS_SUN_HALFWAY_PERMILLE,
-                    (unsigned)s_sun_saved_position);
-            }
-            break;
+        case SUN_STATE_IDLE:       sun_idle(lux_high, at_top, at_bottom);      break;
+        case SUN_STATE_GOING_DOWN: sun_going_down();                            break;
+        case SUN_STATE_AT_HALFWAY: sun_at_halfway(lux_low, at_top, at_bottom); break;
+        case SUN_STATE_RETURNING:  sun_returning(at_top);                       break;
+        case SUN_STATE_CANCELLED:  sun_cancelled(lux_low);                      break;
+    }
+}
 
-        case SUN_STATE_GOING_DOWN:
-            if (s_mode == BLINDS_MODE_MANUAL)
-            {
-                /* Motor already stopped by handle_manual_buttons(). */
-                s_sun_state = SUN_STATE_CANCELLED;
-                LOG("[Sun] Lowering interrupted by manual input. Event cancelled.\n");
-                break;
-            }
-            if (s_position_permille != BLINDS_POSITION_UNKNOWN
-                && s_position_permille <= BLINDS_SUN_HALFWAY_PERMILLE)
-            {
-                stop_motion();
-                s_sun_state = SUN_STATE_AT_HALFWAY;
-                LOG("[Sun] Reached halfway (%u/1000). Waiting for lux to drop.\n",
-                    (unsigned)s_position_permille);
-            }
-            break;
+static void sun_poll_lux(void)
+{
+    s_sun_poll_count++;
+    if (s_sun_poll_count < BLINDS_SUN_POLL_CALLS) return;
 
-        case SUN_STATE_AT_HALFWAY:
-            if (s_mode == BLINDS_MODE_MANUAL)
-            {
-                s_sun_state = SUN_STATE_CANCELLED;
-                LOG("[Sun] Manual input while at halfway. Event cancelled.\n");
-                break;
-            }
-            if (lux_low)
-            {
-                if (s_sun_saved_position != BLINDS_POSITION_UNKNOWN
-                    && s_sun_saved_position > BLINDS_SUN_HALFWAY_PERMILLE)
-                {
-                    s_sun_state = SUN_STATE_RETURNING;
-                    start_motion(BLINDS_STATE_MOVING_UP, at_top, at_bottom);
-                    LOG("[Sun] %.0f lx below threshold. Returning to %u/1000.\n",
-                        (double)s_sun_lux, (unsigned)s_sun_saved_position);
-                }
-                else
-                {
-                    s_sun_state          = SUN_STATE_IDLE;
-                    s_sun_saved_position = BLINDS_POSITION_UNKNOWN;
-                    LOG("[Sun] Lux dropped. No valid saved position. Event complete.\n");
-                }
-            }
-            break;
+    s_sun_poll_count = 0U;
+    float lux;
+    if (VEML7700_GetLuxCorrected(&lux) != VEML7700_OK) return;
 
-        case SUN_STATE_RETURNING:
-            if (s_mode == BLINDS_MODE_MANUAL)
-            {
-                s_sun_state = SUN_STATE_CANCELLED;
-                LOG("[Sun] Return interrupted by manual input. Event cancelled.\n");
-                break;
-            }
-            if (at_top
-                || (s_position_permille != BLINDS_POSITION_UNKNOWN
-                    && s_position_permille >= s_sun_saved_position))
-            {
-                stop_motion();
-                s_sun_saved_position = BLINDS_POSITION_UNKNOWN;
-                s_sun_state          = SUN_STATE_IDLE;
-                LOG("[Sun] Returned to saved position. Event complete.\n");
-            }
-            break;
+    s_sun_lux = lux;
 
-        case SUN_STATE_CANCELLED:
-            if (lux_low)
-            {
-                s_sun_state = SUN_STATE_IDLE;
-                LOG("[Sun] Lux cleared after cancellation. Re-armed.\n");
-            }
-            break;
+    /* Update stable-duration counters. Both reset on a direction change or when
+     * lux is in the hysteresis band — ensuring a full BLINDS_SUN_STABLE_TIME_S
+     * of continuous readings before any transition fires. Only updated on
+     * successful reads so sensor glitches don't advance the counters. */
+    if (s_sun_lux >= BLINDS_SUN_LUX_THRESHOLD)
+    {
+        s_lux_high_stable_polls++;
+        s_lux_low_stable_polls = 0U;
+    }
+    else if (s_sun_lux < (BLINDS_SUN_LUX_THRESHOLD - BLINDS_SUN_LUX_HYSTERESIS))
+    {
+        s_lux_low_stable_polls++;
+        s_lux_high_stable_polls = 0U;
+    }
+    else
+    {
+        s_lux_high_stable_polls = 0U;
+        s_lux_low_stable_polls  = 0U;
+    }
+}
+
+/* Returns true and clears the event when night begins during an active sun
+ * event, so the auto schedule can take over immediately. */
+static bool sun_preempt_for_night(void)
+{
+    if (s_sun_state == SUN_STATE_IDLE || s_sun_state == SUN_STATE_CANCELLED)
+        return false;
+    if (is_daytime(rtc_decimal_hours(&s_rtc_snapshot)))
+        return false;
+
+    if (s_state != BLINDS_STATE_IDLE) stop_motion();
+    s_sun_saved_position    = BLINDS_POSITION_UNKNOWN;
+    s_sun_state             = SUN_STATE_IDLE;
+    s_lux_high_stable_polls = 0U;
+    s_lux_low_stable_polls  = 0U;
+    LOG("[Sun] Night began. Sun event cleared; auto schedule takes over.\n");
+    return true;
+}
+
+static void sun_idle(bool lux_high, bool at_top, bool at_bottom)
+{
+    if (!lux_high
+        || s_mode  != BLINDS_MODE_AUTO
+        || s_state != BLINDS_STATE_IDLE
+        || s_position_permille == BLINDS_POSITION_UNKNOWN
+        || s_position_permille <= BLINDS_SUN_HALFWAY_PERMILLE)
+    {
+        return;
+    }
+
+    s_sun_saved_position = s_position_permille;
+    s_sun_state          = SUN_STATE_GOING_DOWN;
+    start_motion(BLINDS_STATE_MOVING_DOWN, at_top, at_bottom);
+    LOG("[Sun] %.0f lx >= threshold. Lowering to %u/1000. Saved position: %u.\n",
+        (double)s_sun_lux,
+        (unsigned)BLINDS_SUN_HALFWAY_PERMILLE,
+        (unsigned)s_sun_saved_position);
+}
+
+static void sun_going_down(void)
+{
+    if (s_mode == BLINDS_MODE_MANUAL)
+    {
+        /* Motor already stopped by handle_manual_buttons(). */
+        s_sun_state = SUN_STATE_CANCELLED;
+        LOG("[Sun] Lowering interrupted by manual input. Event cancelled.\n");
+        return;
+    }
+    if (s_position_permille != BLINDS_POSITION_UNKNOWN
+        && s_position_permille <= BLINDS_SUN_HALFWAY_PERMILLE)
+    {
+        stop_motion();
+        s_sun_state = SUN_STATE_AT_HALFWAY;
+        LOG("[Sun] Reached halfway (%u/1000). Waiting for lux to drop.\n",
+            (unsigned)s_position_permille);
+    }
+}
+
+static void sun_at_halfway(bool lux_low, bool at_top, bool at_bottom)
+{
+    if (s_mode == BLINDS_MODE_MANUAL)
+    {
+        s_sun_state = SUN_STATE_CANCELLED;
+        LOG("[Sun] Manual input while at halfway. Event cancelled.\n");
+        return;
+    }
+    if (!lux_low) return;
+
+    if (s_sun_saved_position != BLINDS_POSITION_UNKNOWN
+        && s_sun_saved_position > BLINDS_SUN_HALFWAY_PERMILLE)
+    {
+        s_sun_state = SUN_STATE_RETURNING;
+        start_motion(BLINDS_STATE_MOVING_UP, at_top, at_bottom);
+        LOG("[Sun] %.0f lx below threshold. Returning to %u/1000.\n",
+            (double)s_sun_lux, (unsigned)s_sun_saved_position);
+    }
+    else
+    {
+        s_sun_state          = SUN_STATE_IDLE;
+        s_sun_saved_position = BLINDS_POSITION_UNKNOWN;
+        LOG("[Sun] Lux dropped. No valid saved position. Event complete.\n");
+    }
+}
+
+static void sun_returning(bool at_top)
+{
+    if (s_mode == BLINDS_MODE_MANUAL)
+    {
+        s_sun_state = SUN_STATE_CANCELLED;
+        LOG("[Sun] Return interrupted by manual input. Event cancelled.\n");
+        return;
+    }
+    if (at_top
+        || (s_position_permille != BLINDS_POSITION_UNKNOWN
+            && s_position_permille >= s_sun_saved_position))
+    {
+        stop_motion();
+        s_sun_saved_position = BLINDS_POSITION_UNKNOWN;
+        s_sun_state          = SUN_STATE_IDLE;
+        LOG("[Sun] Returned to saved position. Event complete.\n");
+    }
+}
+
+static void sun_cancelled(bool lux_low)
+{
+    if (lux_low)
+    {
+        s_sun_state = SUN_STATE_IDLE;
+        LOG("[Sun] Lux cleared after cancellation. Re-armed.\n");
     }
 }
 
