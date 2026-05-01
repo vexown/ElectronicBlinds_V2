@@ -243,10 +243,10 @@
  *        acts on it.
  *
  * Prevents transient obstructions (passing cloud, brief shadow, sensor noise)
- * from triggering unnecessary blind movements. A value of 60 means the
- * condition must hold for a full minute of successive VEML7700 polls.
+ * from triggering unnecessary blind movements. A value of 15 means the
+ * condition must hold for 15 seconds of successive VEML7700 polls.
  */
-#define BLINDS_SUN_STABLE_TIME_S       60U
+#define BLINDS_SUN_STABLE_TIME_S       15U
 
 /*******************************************************************************/
 /*                                 STATUS CODES                                */
