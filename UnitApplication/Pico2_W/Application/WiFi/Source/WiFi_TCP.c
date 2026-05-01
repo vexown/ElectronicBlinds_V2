@@ -581,7 +581,10 @@ void tcp_client_disconnect(void)
         }
         else
         {
-            LOG("Connection closure initiated successfully. Client state: %d\n", clientGlobal->pcb->state);
+            if (tcp_reconnect_count == 1 || tcp_reconnect_count % 10 == 0)
+            {
+                LOG("Connection closure initiated successfully. Client state: %d\n", clientGlobal->pcb->state);
+            }
         }
 
         /* If the connection closure was initiated successfully but is not fully closed yet (4-way handshake not completed) then wait a bit */
@@ -626,7 +629,10 @@ void tcp_client_disconnect(void)
         }
         else
         {
-            LOG("Connection closed successfully. Client state: %d\n", clientGlobal->pcb->state);
+            if (tcp_reconnect_count == 1 || tcp_reconnect_count % 10 == 0)
+            {
+                LOG("Connection closed successfully. Client state: %d\n", clientGlobal->pcb->state);
+            }
         }
 
         /* As a last resort, if after the timeout the connection is still not fully closed, 
