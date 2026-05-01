@@ -366,6 +366,22 @@ static void handle_limit_switches(bool at_top, bool at_bottom)
         s_position_permille    = 0U;
         LOG("[Blinds] BOTTOM limit reached. Motor stopped.\n");
     }
+    else if (s_state == BLINDS_STATE_IDLE && s_position_permille == BLINDS_POSITION_UNKNOWN)
+    {
+        /* Resolve position at startup (or post-watchdog) when the motor is idle
+         * but a limit switch is already active — prevents sun control from being
+         * permanently blocked by an unknown position. */
+        if (at_top)
+        {
+            s_position_permille = 1000U;
+            LOG("[Blinds] Position resolved to TOP (limit active at idle).\n");
+        }
+        else if (at_bottom)
+        {
+            s_position_permille = 0U;
+            LOG("[Blinds] Position resolved to BOTTOM (limit active at idle).\n");
+        }
+    }
 }
 
 /**
