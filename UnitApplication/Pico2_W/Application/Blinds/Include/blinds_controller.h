@@ -232,10 +232,16 @@
 #define BLINDS_SUN_HALFWAY_PERMILLE    500U
 
 /**
+ * @brief How often (in ms) to poll the VEML7700 for a lux reading
+ * This is more understandable for humans, later this is converted to the number of task calls
+ */
+#define BLINDS_SUN_POLL_TIME_MS        500U
+
+/**
  * @brief How often (in task calls) to poll the VEML7700 for a lux reading.
  * 10 × 50 ms = 500 ms — well above the 100 ms integration time.
  */
-#define BLINDS_SUN_POLL_CALLS          ((uint32_t)(500U) / BLINDS_TASK_PERIOD_MS)
+#define BLINDS_SUN_POLL_CALLS          ((uint32_t)(BLINDS_SUN_POLL_TIME_MS) / BLINDS_TASK_PERIOD_MS)
 
 /**
  * @brief Minimum time (s) the lux reading must remain continuously above the
