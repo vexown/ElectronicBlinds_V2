@@ -41,6 +41,9 @@
 #include "FreeRTOS.h"
 #include "task.h"
 
+/* Misc includes */
+#include "FaultHandler.h"
+
 /*******************************************************************************/
 /*                          GLOBAL FUNCTION DEFINITIONS                        */
 /*******************************************************************************/
@@ -61,8 +64,7 @@
  */
 void vApplicationMallocFailedHook(void)
 {
-    /* Force an assertion failure by passing a NULL pointer to the configASSERT macro, triggering the error handling routine. */
-    configASSERT(( volatile void * ) NULL);
+    FaultHandler_RecordMallocFailed();
 }
 
 /* 
@@ -80,13 +82,8 @@ void vApplicationMallocFailedHook(void)
  */
 void vApplicationStackOverflowHook(TaskHandle_t pxTask, char *pcTaskName)
 {
-    /* cast to void to aVOID (heh) compiler warnings */ 
     (void)pxTask;
-        
-    printf("Stack Overflow in task: %s\n", pcTaskName);
-
-    /* Force an assertion failure by passing a NULL pointer to the configASSERT macro, triggering the error handling routine. */
-    configASSERT(( volatile void * ) NULL);
+    FaultHandler_RecordStackOverflow(pcTaskName);
 }
 
 

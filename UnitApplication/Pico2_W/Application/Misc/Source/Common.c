@@ -16,6 +16,7 @@
 
 /* Misc includes */
 #include "Common.h"
+#include "FaultHandler.h"
 
 /*******************************************************************************/
 /*                          GLOBAL FUNCTION DEFINITIONS                        */
@@ -63,17 +64,10 @@ void CriticalErrorHandler(uint8_t moduleId, uint8_t errorId)
  */
 void vAssertCalled( const char *pcFile, uint32_t ulLine )
 {
-    /* Inside this function, pcFile holds the name of the source file that
-    contains the line that detected the error, and ulLine holds the line
-    number in the source file. The pcFile and ulLine values can be printed
-    out, or otherwise recorded, before the following infinite loop is
-    entered. (TODO, for now just printing but consider other ways of sending/storing this error info) */
-    printf("Assertion failed in file: %s at line: %u\n", pcFile, (unsigned int)ulLine);
-
-    /* Disable interrupts so the tick interrupt stops executing, then sit in a
-    loop so execution does not move past the line that failed the assertion. */
-    taskDISABLE_INTERRUPTS();
-    for( ;; );
+    /* Record file/line into watchdog scratch regs, log, then reboot. After the
+     * reboot FaultHandler_ReportLastCrash() prints the saved info so a crash
+     * leaves a trail even if nothing was watching the terminal at the time. */
+    FaultHandler_RecordAssert(pcFile, ulLine);
 }
 
 

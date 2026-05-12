@@ -49,6 +49,7 @@
 #include <stdio.h>
 #include "pico/stdlib.h"
 #include "OS_manager.h"
+#include "FaultHandler.h"
 
 /*******************************************************************************/
 /*                        STATIC FUNCTION DECLARATIONS                         */
@@ -75,6 +76,7 @@ static void setupHardware( void );
 int main(void)
 {
     setupHardware();
+    FaultHandler_ReportLastCrash();
     OS_start();
 }
 
