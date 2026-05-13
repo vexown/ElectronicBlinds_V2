@@ -21,6 +21,8 @@
 /*******************************************************************************/
 
 /* Upper 20 bits = magic ("FA017"), lower 12 bits = fault type. */
+/* The magic value helps distinguish a real fault record from random/zero data in the
+ * scratch registers after a power cycle, brown-out, glitch or other random crash. */
 #define FAULT_MAGIC_BASE        0xFA017000U
 #define FAULT_MAGIC_MASK        0xFFFFF000U
 #define FAULT_TYPE_MASK         0x00000FFFU
