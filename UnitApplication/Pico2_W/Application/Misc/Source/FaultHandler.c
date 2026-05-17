@@ -34,7 +34,13 @@
 #define FAULT_TYPE_MALLOC_FAIL  0x004U
 
 /* Standard Cortex-M System Control Block registers. Accessed directly to
- * avoid pulling CMSIS into the rest of the codebase. */
+ * avoid pulling CMSIS into the rest of the codebase. 
+ *
+ * See RP2350 datasheet from details on the CFSR and HFSR Registers 
+ * In short:
+ *      CFSR = Configurable Fault Status Register - holds info on UsageFault, BusFault and MemManage exceptions
+ *      HFSR = HardFault Status Register - shows the cause of any HardFaults 
+ */
 #define SCB_CFSR_ADDR           0xE000ED28U
 #define SCB_HFSR_ADDR           0xE000ED2CU
 
@@ -51,18 +57,79 @@ __attribute__((noreturn, used)) void FaultHandler_HardFaultC(uint32_t *frame);
 /*                          STATIC FUNCTION DEFINITIONS                        */
 /*******************************************************************************/
 
+/**
+ * @brief Hash a NUL-terminated string into a 32-bit value using FNV-1a.
+ *        FNV-1a is a fast, non-cryptographic hash that turns an arbitrary-length 
+ *        string into a fixed-size 32-bit fingerprint.
+ *
+ * Why we need a hash here:
+ *   configASSERT() gives us a __FILE__ pointer like "Application/Foo/Bar.c"
+ *   plus a line number. We only have one 32-bit scratch register to spare
+ *   for the file identity, which is nowhere near enough to store the path
+ *   itself. Instead we store a 32-bit fingerprint of the path and, on the
+ *   next boot, the report code prints that fingerprint. Match it against
+ *   `grep -rn` over the source tree (or a precomputed map) to recover the
+ *   original filename.
+ *
+ * Why FNV-1a specifically:
+ *   - Tiny: a couple of arithmetic ops per byte, no tables, no allocations,
+ *     safe to call from awkward contexts.
+ *   - Good enough distribution for short ASCII paths so different files
+ *     almost never collide to the same 32-bit value in practice.
+ *   - Public-domain, well-known constants - the two magic numbers below are
+ *     not arbitrary, they are the standardised FNV-1a parameters.
+ *
+ * The two magic numbers (from the FNV-1a specification - RFC 9923):
+ *   - 0x811C9DC5 = FNV offset basis: the seed value the hash starts from.
+ *   - 0x01000193 = FNV prime:        the multiplier applied each iteration.
+ * These were chosen by the FNV authors to give good avalanche behaviour on
+ * 32-bit outputs; do not change them or the hash stops being FNV-1a.
+ *
+ * @param s   NUL-terminated input string; NULL is tolerated and yields 0.
+ * @return    32-bit hash, or 0 if @p s is NULL.
+ */
 static uint32_t fnv1a32(const char *s)
 {
+    /* Start from the FNV-1a offset basis. */
     uint32_t h = 0x811C9DC5U;
-    if (s == NULL)
+
+    /* Defensive: callers may hand us a NULL __FILE__ in odd build configs. */
+    if (s == NULL) return 0;
+
+    /* FNV-1a core loop: XOR-then-multiply for every byte of the string.
+     * The "1a" variant XORs first and multiplies after (FNV-1 does the
+     * reverse); 1a has measurably better avalanche, which is why it is
+     * the recommended variant. 
+     */
+    while (*s) // will naturally end at the NULL terminator of the hash input string
     {
-        return 0;
+        /* Explanation of (uint32_t)(uint8_t)(*s) conversion below:
+        *
+        *  INTEGER CONVERSION & VALUE PRESERVATION BEHAVIOR (C11 §6.3.1.3):
+        *
+        * 1. Direct Unsigned Promotion (Sign Extension):
+        *    When converting a negative signed type (e.g., 'char' at 0x80 = -128) 
+        *    directly to a larger unsigned type like 'uint32_t', C11 §6.3.1.3 p2 
+        *    mandates modular wrapping: Value + (MAX + 1).
+        *    Calculation: -128 + 4294967296 = 4294967168 (Hex: 0xFFFFFF80).
+        *    This effectively triggers hardware sign extension, altering the hex pattern.
+        *
+        * 2. Same-Width Cast (Modulo Alignment):
+        *    Converting 'char' (-128) to 'uint8_t' applies the same rule:
+        *    Calculation: -128 + 256 = 128 (Hex: 0x80).
+        *    The underlying bit pattern remains 0x80, but the value becomes positive.
+        *
+        * 3. Preserving Raw Hex/Byte Value (Safe Widening):
+        *    To widen a signed byte while preserving its literal hex value (0x80), 
+        *    you must cast to 'uint8_t' first, then to 'uint32_t'. 
+        *    The intermediate 'uint8_t' holds a value of 128. Moving from 'uint8_t' 
+        *    to 'uint32_t' invokes C11 §6.3.1.3 p1 (Value Preservation), because 
+        *    128 fits perfectly in the target type. Result: 128 (Hex: 0x00000080).
+        */
+        h ^= (uint32_t)(uint8_t)(*s++);  /* fold next byte into the state */
+        h *= 0x01000193U;                /* mix bits via the FNV prime    */
     }
-    while (*s)
-    {
-        h ^= (uint32_t)(uint8_t)(*s++);
-        h *= 0x01000193U;
-    }
+
     return h;
 }
 
