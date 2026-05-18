@@ -133,26 +133,59 @@ static uint32_t fnv1a32(const char *s)
     return h;
 }
 
-/* Pack the first up-to-4 characters of s into a u32 (LSB = first char), so
- * "Moni" -> 0x696E6F4D. Lets the post-boot log show recognisable task names. */
+/**
+ * @brief Pack the first up-to-4 characters of a string into a single uint32_t.
+ *
+ * Layout: LSB = first char, MSB = fourth char. For example "Moni" packs as
+ *   's[0]'='M' (0x4D)  -> bits  7..0
+ *   's[1]'='o' (0x6F)  -> bits 15..8
+ *   's[2]'='n' (0x6E)  -> bits 23..16
+ *   's[3]'='i' (0x69)  -> bits 31..24
+ * yielding 0x696E6F4D.
+ *
+ * Why we do this:
+ *   On a FreeRTOS stack-overflow hook we receive the task name as a pointer
+ *   but we only have one 32-bit scratch slot to remember it across the
+ *   reboot. Storing the first four characters is enough to identify the
+ *   offending task in practice (FreeRTOS task names are typically short and
+ *   start uniquely - "Moni", "Wifi", "Stat", etc.). Unpacking on the next
+ *   boot reverses the layout to print a recognisable name.
+ *
+ * @param s   NUL-terminated input string; NULL is tolerated and yields 0.
+ * @return    The packed 32-bit value as described above.
+ */
 static uint32_t pack_first4(const char *s)
 {
     uint32_t out = 0;
-    if (s == NULL)
-    {
-        return 0;
-    }
-    for (int i = 0; i < 4 && s[i] != '\0'; i++)
+
+    if (s == NULL) return 0;
+
+    for (int i = 0; ((i < 4) && (s[i] != '\0')); i++)
     {
         out |= ((uint32_t)(uint8_t)s[i]) << (i * 8);
     }
+    
     return out;
 }
 
+/**
+ * @brief Trigger a clean watchdog-driven reboot and never return.
+ *
+ * Called at the tail of every fault path (HardFault, assert, stack
+ * overflow, malloc failure). watchdog_reboot(pc=0, sp=0, delay_ms=10) asks
+ * the SDK for a regular reset after 10 ms; that small delay gives the UART
+ * transmit FIFO time to drain so the live "[FAULT] ..." line we just
+ * printed actually reaches the terminal before the reset cuts the link.
+ *
+ * Important: watchdog_reboot() only writes scratch[4..7] (sentinel + PC/SP
+ * handoff consumed by the boot ROM), so our crash record in scratch[1..3]
+ * is preserved across the reset and can be reported on the next boot.
+ *
+ * The infinite loop after the call is unreachable but required so the
+ * compiler is happy with the noreturn contract until the watchdog fires.
+ */
 __attribute__((noreturn)) static void reboot_now(void)
 {
-    /* 10 ms gives UART tx FIFO time to drain. watchdog_reboot writes
-     * scratch[4..7] only - our scratch[1..3] crash info survives. */
     watchdog_reboot(0, 0, 10);
     for ( ;; )
     {
@@ -160,8 +193,22 @@ __attribute__((noreturn)) static void reboot_now(void)
     }
 }
 
-/* Minimal raw UART emit. Used from HardFault context where the stdio mutex
- * may not be safe to acquire. */
+/**
+ * @brief Write a NUL-terminated string straight to the default UART.
+ *
+ * This is a deliberate alternative to printf()/puts() for use from a
+ * HardFault context. Inside an exception we may have arrived with corrupt
+ * state, interrupts in an awkward configuration, or with the stdio
+ * subsystem's internal mutex held by a preempted task - calling printf()
+ * there can deadlock or crash again. uart_putc_raw() is a thin register
+ * write to the UART data register with no locking, no formatting, and no
+ * dependency on FreeRTOS, so it is safe in nearly any context.
+ *
+ * Use this only on the fault path. Outside of fault context the normal
+ * printf() path is fine and gives nicer output.
+ *
+ * @param s   NUL-terminated string to emit; must not be NULL.
+ */
 static void emit_raw(const char *s)
 {
     while (*s)
@@ -170,16 +217,36 @@ static void emit_raw(const char *s)
     }
 }
 
+/**
+ * @brief Emit a 32-bit value to the UART as "0x" + 8 lowercase hex digits.
+ *
+ * Companion to emit_raw() for the fault-path logger. printf("%08lx", ...)
+ * would be simpler but pulls in the full formatted-output path (locks,
+ * heap-backed buffers, varargs machinery) which is unsafe from a
+ * HardFault. Doing the hex conversion by hand keeps the operation to a
+ * fixed-size stack buffer and a sequence of UART register writes - no
+ * allocations, no locks, no recursion.
+ *
+ * Output is always exactly 10 characters ("0xDEADBEEF"-style), no newline,
+ * no leading or trailing space; callers concatenate spacing/labels via
+ * emit_raw().
+ *
+ * @param v   The 32-bit value to print.
+ */
 static void emit_hex32(uint32_t v)
 {
     static const char digits[] = "0123456789abcdef";
     char buf[10];
+
+    /* Compose the hex string */
     buf[0] = '0';
     buf[1] = 'x';
     for (int i = 0; i < 8; i++)
     {
         buf[2 + i] = digits[(v >> (28 - (i * 4))) & 0xFU];
     }
+
+    /* Send the hex string */
     for (int i = 0; i < 10; i++)
     {
         uart_putc_raw(uart_default, buf[i]);
