@@ -189,7 +189,7 @@ __attribute__((noreturn)) static void reboot_now(void)
     watchdog_reboot(0, 0, 10);
     for ( ;; )
     {
-        tight_loop_contents();
+        tight_loop_contents(); // pico-sdk no-op function
     }
 }
 
@@ -253,8 +253,187 @@ static void emit_hex32(uint32_t v)
     }
 }
 
-/* C side of the HardFault handler. frame points at the stacked exception
- * frame: { R0, R1, R2, R3, R12, LR, PC, xPSR, ... }. */
+/**
+ * @brief C-language half of the HardFault handler.
+ *
+ * Receives a pointer to the exception stack frame that the CPU automatically
+ * pushed on entry into HardFault. This long comment documents both what this
+ * function does and the surrounding Cortex-M exception model that makes it
+ * possible to write a fault handler in plain C.
+ *
+ * --------------------------------------------------------------------------
+ *  1. Context stacking (the "exception stack frame")
+ * --------------------------------------------------------------------------
+ *
+ * References:
+ *   - Armv8-M Architecture Reference Manual (DDI0553), section
+ *     "B3.18  Exception handling" - the formal definition.
+ *   - Arm Cortex-M33 Devices Generic User Guide (DUI0913),
+ *     "Exception entry" - friendlier version.
+ *   https://developer.arm.com/documentation/100235/0100/The-Cortex-M33-Processor/Exception-model/Exception-entry-and-return/Exception-entry-?lang=en 
+ *
+ * From the Cortex-M33 GUG:
+ *   "When the processor takes an exception, unless the exception is a
+ *    tail-chained or a late-arriving exception, the processor pushes
+ *    information onto the current stack. This operation is referred to as
+ *    stacking and the structure of the data stacked is referred as the
+ *    stack frame. In parallel to the stacking operation, the processor
+ *    performs a vector fetch that reads the exception handler start address
+ *    from the vector table. When stacking is complete, the processor starts
+ *    executing the exception handler."
+ *
+ * The "current stack" is whichever of the two stacks was active at the
+ * moment of the fault: the Main Stack Pointer (MSP, used by ISRs and pre-RTOS
+ * startup) or the Process Stack Pointer (PSP, used by FreeRTOS tasks). The
+ * naked assembly trampoline isr_hardfault() picks the right one by testing
+ * bit 2 (SPSEL) of the EXC_RETURN value left in LR by the CPU, then tail-
+ * calls here with that pointer in r0.
+ *
+ * Basic ("integer-only") frame layout, 8 words = 32 bytes:
+ *
+ *      offset  index   contents
+ *      0x00    [0]     R0
+ *      0x04    [1]     R1
+ *      0x08    [2]     R2
+ *      0x0C    [3]     R3
+ *      0x10    [4]     R12
+ *      0x14    [5]     LR  - the interrupted code's real link register
+ *      0x18    [6]     PC  - return address (see section 3 below)
+ *      0x1C    [7]     xPSR (RETPSR) - see section 4 below
+ *
+ * If the FPU was active at fault time, the CPU pushes an "extended" frame
+ * that also includes S0..S15 + FPSCR (and possibly more under Armv8-M with
+ * the Security Extension). We don't use the FPU on this project, so the
+ * basic frame is what we get.
+ *
+ * --------------------------------------------------------------------------
+ *  2. Why exactly these registers? -> AAPCS, and "C handlers for free"
+ * --------------------------------------------------------------------------
+ *
+ * The pushed set - R0..R3, R12, LR, PC, xPSR - is exactly the caller-saved
+ * set under the Arm Procedure Call Standard (AAPCS). Caller-saved means
+ * "any normal C function is allowed to clobber these without saving them".
+ * The callee-saved registers (R4..R11) are NOT in the frame because any C
+ * function that wants to use them is already obliged by AAPCS to save them
+ * in its own prologue.
+ *
+ * Combine those two halves and you get a remarkable property: a Cortex-M
+ * exception handler can be written as a plain C function. The CPU saves
+ * the caller-saved half; the compiler-emitted prologue saves whichever
+ * callee-saved registers the handler actually touches. Together, the full
+ * register context of the interrupted code is preserved across the handler
+ * with no special attribute, no __attribute__((interrupt)), no hand-written
+ * prologue. This is why every entry in the pico-sdk vector table is just a
+ * plain `void name(void)` function pointer.
+ *
+ * (The only reason isr_hardfault() in this file IS hand-written assembly
+ * is that we need to inspect LR/EXC_RETURN _before_ the compiler-emitted
+ * prologue overwrites it - to pick MSP vs PSP. Plain C handlers that don't
+ * need to know which stack they were called from need no assembly at all.)
+ *
+ * --------------------------------------------------------------------------
+ *  3. The "PC" slot (frame[6]) and the LR slot (frame[5])
+ * --------------------------------------------------------------------------
+ *
+ * Two related-but-different things both get called "PC", which is a common
+ * source of confusion:
+ *
+ *   a) The live PC register (R15) - the program counter you learned about.
+ *      During the handler it points to handler code, as you would expect.
+ *      Nothing about PC's normal semantics changes.
+ *
+ *   b) The PC slot in the exception frame (frame[6]) - a saved 32-bit word
+ *      the CPU wrote at exception entry. The Armv8-M ARM calls this slot
+ *      "ReturnAddress"; the Cortex-M33 GUG calls it "PC" because it is the
+ *      value the CPU will reload into the live PC on exception return.
+ *      The architecture (B3.18) defines what value the CPU stores there
+ *      depending on the kind of exception:
+ *
+ *          - Asynchronous interrupt (SysTick, external IRQ, PendSV):
+ *            address of the NEXT instruction to execute.
+ *          - Synchronous precise fault (HardFault, BusFault, UsageFault,
+ *            MemManage on instruction fetch, undefined opcode, etc.):
+ *            address of the FAULTING instruction itself.
+ *          - SVC / BKPT: address of the instruction AFTER the SVC/BKPT.
+ *
+ *      HardFault is a synchronous precise fault, so frame[6] for us is the
+ *      faulting PC. That is what makes it useful for triage - run
+ *      `arm-none-eabi-addr2line -e <elf> <PC>` against the printed value
+ *      and you get the exact source line that blew up.
+ *
+ * Similarly there are two LR-shaped values:
+ *
+ *   a) The live LR register on entry to the handler holds the EXC_RETURN
+ *      payload (e.g. 0xFFFFFFFD on Armv8-M Mainline), not a normal return
+ *      address. Its bits encode SPSEL (which stack), Mode (thread/handler),
+ *      FType (FP frame or not), and on Armv8-M S/ES (security domain).
+ *      `bx lr` with EXC_RETURN is how the handler triggers exception
+ *      return. The trampoline tests bit 2 (SPSEL) before any C code runs.
+ *
+ *   b) The LR slot in the frame (frame[5]) holds the interrupted code's
+ *      REAL R14 - i.e. the genuine link-register value the faulting
+ *      function was using to know where to return to its caller. We print
+ *      this as "LR=" to help walk one frame up the call stack during
+ *      post-mortem analysis.
+ *
+ * --------------------------------------------------------------------------
+ *  4. xPSR / RETPSR (frame[7])
+ * --------------------------------------------------------------------------
+ *
+ * Same value-from-two-views story: the GUG calls this slot "xPSR" because
+ * that is where the value will be restored on return; the Armv8-M ARM
+ * calls it "RETPSR" because the stacked copy has one extra bit defined.
+ *
+ * Specifically, AAPCS requires the SP to be 8-byte aligned at any public
+ * function boundary, including exception handlers. On exception entry the
+ * CPU forces 8-byte alignment by adding 4 bytes of padding before stacking
+ * if the SP was only 4-byte aligned, and it records whether that padding
+ * was applied in bit 9 of the stacked RETPSR. The live xPSR register does
+ * not have a meaningful bit 9; only the stacked copy does. On exception
+ * return the CPU consults bit 9 of frame[7] to undo the padding.
+ *
+ * We do not read frame[7] in this handler. It is documented here for the
+ * benefit of anyone extending the handler later who needs to recover the
+ * exact pre-fault SP, or to print the flags (N/Z/C/V/Q) or IT state of the
+ * faulting code.
+ *
+ * --------------------------------------------------------------------------
+ *  5. Where the fault came from -> CFSR and HFSR
+ * --------------------------------------------------------------------------
+ *
+ * The stack frame tells us WHERE the fault happened (the faulting PC, the
+ * caller via LR). It does NOT tell us WHY. For that the Cortex-M System
+ * Control Block exposes two fixed-address status registers:
+ *
+ *   - CFSR @ 0xE000ED28 - Configurable Fault Status Register.
+ *     Three sub-bytes for MemManage, BusFault and UsageFault flags;
+ *     bits like IBUSERR (instruction-bus error), PRECISERR (precise data
+ *     access error), INVSTATE (invalid Thumb state), DIVBYZERO, UNALIGNED.
+ *   - HFSR @ 0xE000ED2C - HardFault Status Register.
+ *     Bit FORCED tells you the original fault was escalated to a HardFault
+ *     (e.g. UsageFault arrived but UsageFault is disabled, or a fault
+ *     happened inside an already-running fault handler). Bit VECTTBL means
+ *     a fault occurred during the initial vector fetch.
+ *
+ * Snapshotting both registers before we reboot is what gives a
+ * post-mortem analysis a real chance of explaining the root cause.
+ *
+ * --------------------------------------------------------------------------
+ *  6. Actions taken by this function (in order)
+ * --------------------------------------------------------------------------
+ *
+ *   1. Read PC and LR out of the stacked frame (frame[6], frame[5]).
+ *   2. Snapshot CFSR and HFSR from the SCB.
+ *   3. Write magic|FAULT_TYPE_HARDFAULT, PC, and LR into watchdog scratch
+ *      [1..3] so the next boot can report them via
+ *      FaultHandler_ReportLastCrash().
+ *   4. Emit a live "[FAULT] HardFault PC=... LR=... CFSR=... HFSR=..."
+ *      line via the raw UART path (safe from exception context).
+ *   5. Reboot through the watchdog.
+ *
+ * @param frame   Pointer to the stacked exception frame (MSP or PSP),
+ *                supplied by the isr_hardfault() trampoline in r0.
+ */
 __attribute__((noreturn, used)) void FaultHandler_HardFaultC(uint32_t *frame)
 {
     const uint32_t pc   = frame[6];
