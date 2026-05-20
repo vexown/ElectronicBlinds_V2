@@ -468,10 +468,7 @@ void FaultHandler_ReportLastCrash(void)
     const uint32_t data1 = watchdog_hw->scratch[2];
     const uint32_t data2 = watchdog_hw->scratch[3];
 
-    if ((tag & FAULT_MAGIC_MASK) != FAULT_MAGIC_BASE)
-    {
-        return;
-    }
+    if ((tag & FAULT_MAGIC_MASK) != FAULT_MAGIC_BASE) return;
 
     const uint32_t type = tag & FAULT_TYPE_MASK;
     printf("\n---- Previous boot crashed ----\n");
@@ -484,11 +481,13 @@ void FaultHandler_ReportLastCrash(void)
             printf("Resolve PC with: arm-none-eabi-addr2line -e <elf> 0x%08lx\n",
                    (unsigned long)data1);
             break;
+
         case FAULT_TYPE_ASSERT:
             printf("Type: configASSERT\n");
             printf("Line %lu (file hash 0x%08lx)\n",
                    (unsigned long)data1, (unsigned long)data2);
             break;
+            
         case FAULT_TYPE_STACK_OVF:
         {
             /* data2 holds first 4 chars of task name as packed ASCII. */
@@ -501,9 +500,11 @@ void FaultHandler_ReportLastCrash(void)
             printf("Task name starts with: '%s'\n", name);
             break;
         }
+
         case FAULT_TYPE_MALLOC_FAIL:
             printf("Type: pvPortMalloc failed (out of FreeRTOS heap)\n");
             break;
+            
         default:
             printf("Type: unknown (0x%lx)\n", (unsigned long)type);
             break;
