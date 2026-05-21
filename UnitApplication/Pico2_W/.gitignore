@@ -5,3 +5,4 @@ output/binary_analysis_moduri
 *_dump.bin
 StaticAnalysis_output.txt
 build.log
+file_hashes.txt

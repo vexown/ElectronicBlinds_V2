@@ -398,6 +398,12 @@ cp -v ./Bootloader/bootloader.bin ../output
 
 cp -v ./Bootloader/metadata.bin ../output
 
+# Generate the FNV-1a file-hash map used to decode configASSERT crash reports.
+# Non-critical: a failure here must not fail the firmware build.
+echo "Generating file hash map..."
+python3 "$REPO_ROOT/UnitApplication/Pico2_W/Tools/gen_file_hashes.py" "$REPO_ROOT" ../output/file_hashes.txt \
+    || echo "Warning: file hash map generation failed (skipping)"
+
 echo "Done"
 
 # Prompt the user to press any key to exit
