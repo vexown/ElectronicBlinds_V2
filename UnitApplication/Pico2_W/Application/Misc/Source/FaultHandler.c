@@ -552,9 +552,69 @@ __attribute__((noreturn)) void FaultHandler_RecordMallocFailed(void)
     reboot_now();
 }
 
-/* Cortex-M HardFault entry. Picks MSP or PSP based on EXC_RETURN bit 2, then
- * tail-calls the C handler with the stacked frame pointer in r0.
- * Overrides the weak symbol from pico-sdk's crt0.S. */
+/**
+ * @brief Cortex-M HardFault entry point (assembly trampoline).
+ *
+ * "Trampoline" here means a tiny stub whose only job is to capture some
+ * fragile machine state and immediately bounce control on to the real
+ * handler - the name comes from that bounce. This stub reads which stack
+ * pointer the faulting code was using, then jumps straight into the C
+ * handler FaultHandler_HardFaultC(). Keeping it tiny is deliberate: a
+ * `naked` function (see below) can hold almost nothing but a branch.
+ *
+ * Overriding the SDK's weak handler:
+ * ----------------------------------
+ * The HardFault slot of the Cortex-M vector table is filled by the pico-sdk
+ * crt0.S with the symbol `isr_hardfault`, which the SDK declares as a *weak*
+ * symbol whose default body is a single `bkpt #0` instruction. Defining our
+ * own *strong* (non-weak, external-linkage) function with the exact same name
+ * makes the linker bind the vector to us instead - that is the whole override
+ * mechanism. Two consequences follow:
+ *   - The name must be exactly `isr_hardfault`; rename it and the linker
+ *     silently keeps the SDK default (no warning).
+ *   - It must not be `static`; internal linkage would disqualify it from
+ *     overriding the global weak symbol.
+ * Without our override a HardFault hits the SDK's `bkpt #0`: with a debugger
+ * attached the core halts into the debugger; with no debugger it escalates to
+ * a fault that cannot be taken at HardFault priority, and the CPU enters
+ * Lockup - frozen, with no crash diagnostics, until an external reset.
+ *
+ * Why a "naked" function:
+ * -----------------------
+ * `naked` (a GCC/Clang ARM function attribute) tells the compiler to emit
+ * *only* the body we write - no prologue and no epilogue, at every
+ * optimization level, and no implicit return. The body must therefore be
+ * pure inline assembly (C in a naked function is undefined - there is no
+ * guaranteed stack frame for locals) and must end with its own branch.
+ * We need this because on exception entry the hardware places EXC_RETURN in
+ * LR, and bit 2 of that value tells us which stack the faulting code used. A
+ * normal function's prologue runs *first* and is free to clobber LR / move
+ * SP, so by the time any C executed the value would be gone. `naked`
+ * guarantees our `tst lr` is the very first instruction to run, with LR
+ * still holding the pristine EXC_RETURN.
+ * (See GCC docs on "naked" - https://gcc.gnu.org/onlinedocs/gcc-16.1.0/gcc/Common-Attributes.html )
+ *
+ * What the assembly does:
+ * -----------------------
+ *
+ *      tst   lr, #4              -> test bit 2 of EXC_RETURN held in LR
+ *      ite   eq                  -> if/then/else block (Thumb2)
+ *      mrseq r0, msp             -> bit 2 clear -> we were on the Main Stack (MSP)
+ *      mrsne r0, psp             -> bit 2 set   -> we were on the Process Stack (PSP)
+ *      b     FaultHandler_HardFaultC
+ *
+ * EXC_RETURN bit 2 is the standard Cortex-M indicator of which stack
+ * pointer was active at the moment of the exception:
+ *   - 0 means the faulting context was using MSP (typically an ISR or
+ *     pre-RTOS startup code),
+ *   - 1 means it was using PSP (typically a FreeRTOS task).
+ *
+ * The chosen stack pointer is loaded into r0 - the ARM AAPCS first-argument
+ * register - so that the unconditional branch to FaultHandler_HardFaultC()
+ * arrives with the correct exception frame pointer in r0. The "b" (not "bl")
+ * makes this a tail call: there is nothing to return to anyway because the
+ * C handler is noreturn and ends in a watchdog reboot.
+ */
 __attribute__((naked)) void isr_hardfault(void)
 {
     __asm volatile (
