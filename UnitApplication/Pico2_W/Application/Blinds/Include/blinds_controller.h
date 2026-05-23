@@ -220,7 +220,7 @@
  * (BLINDS_SUN_LUX_THRESHOLD - BLINDS_SUN_LUX_HYSTERESIS). Prevents
  * rapid toggling when illuminance hovers near the trigger point.
  */
-#define BLINDS_SUN_LUX_HYSTERESIS      1000.0f
+#define BLINDS_SUN_LUX_HYSTERESIS      500.0f
 
 /**
  * @brief Sun-position target as a per-mille fraction of the travel range.
