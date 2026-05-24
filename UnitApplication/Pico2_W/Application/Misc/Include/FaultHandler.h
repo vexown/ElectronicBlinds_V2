@@ -93,14 +93,29 @@
  *              ------------------
  *              Each FreeRTOS task has its own fixed-size stack. If a task uses
  *              more stack than was allocated for it, it overflows into
- *              neighbouring memory. With configCHECK_FOR_STACK_OVERFLOW
- *              enabled, FreeRTOS checks for this at every context switch -
- *              either by bounds-checking the task's stack pointer, or by
- *              verifying that a known fill pattern at the end of the stack is
- *              still intact. On detection it calls
- *              vApplicationStackOverflowHook(), which routes to
- *              FaultHandler_RecordStackOverflow(). Note this is best-effort:
- *              the overflow has already happened by the time it is noticed.
+ *              neighbouring memory. There are two independent layers of
+ *              detection on this platform, and each one is handled here:
+ *
+ *                1) FreeRTOS software check (configCHECK_FOR_STACK_OVERFLOW).
+ *                   The kernel either bounds-checks the task's stack pointer
+ *                   or verifies a known fill pattern at the end of the stack,
+ *                   at every context switch. On detection it calls
+ *                   vApplicationStackOverflowHook(), which routes to
+ *                   FaultHandler_RecordStackOverflow(). This is best-effort
+ *                   and only fires at context-switch boundaries (typically
+ *                   every tick), so a fast overflow can outrun it.
+ *
+ *                2) Cortex-M33 hardware STKOF (Armv8-M Mainline).
+ *                   The CPU has MSPLIM/PSPLIM stack-limit registers; the
+ *                   FreeRTOS port sets PSPLIM to each task's stack base. When
+ *                   SP would dip below the limit, the CPU itself raises a
+ *                   UsageFault with CFSR.UFSR.STKOF set. This fires
+ *                   synchronously and is what catches tight recursions in
+ *                   nanoseconds. The HardFault handler in this module
+ *                   detects this bit and routes the report to the stack
+ *                   overflow output path so the post-boot summary stays
+ *                   consistent across both detection routes (it tags the
+ *                   source as "hardware STKOF" so the two can be told apart).
  *
  *              (D) malloc failure (heap exhaustion)
  *              ------------------------------------
@@ -161,7 +176,8 @@ __attribute__((noreturn)) void FaultHandler_RecordAssert(const char *file, uint3
  *
  * Called from vApplicationStackOverflowHook(). Stores:
  *   - scratch[1] = magic | FAULT_TYPE_STACK_OVF
- *   - scratch[2] = 0 (unused)
+ *   - scratch[2] = source discriminator (0 = FreeRTOS pattern check, written
+ *                  here; the HardFault path writes 1 for hardware STKOF)
  *   - scratch[3] = first 4 chars of task_name packed as little-endian ASCII
  *
  * The task name is truncated to 4 characters to fit a single scratch slot;

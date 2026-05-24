@@ -16,6 +16,13 @@
 #include "hardware/watchdog.h"
 #include "hardware/structs/watchdog.h"
 
+/* Needed by the HardFault path for the Armv8-M-Mainline UFSR.STKOF case:
+ * we read pxCurrentTCB (with a NULL guard) and call pcTaskGetName() to label
+ * the offending task. Everything else in this file is FreeRTOS-free; these
+ * two includes only get used inside the STKOF branch. */
+#include "FreeRTOS.h"
+#include "task.h"
+
 /*******************************************************************************/
 /*                                  MACROS                                     */
 /*******************************************************************************/
@@ -43,6 +50,21 @@
  */
 #define SCB_CFSR_ADDR           0xE000ED28U
 #define SCB_HFSR_ADDR           0xE000ED2CU
+
+/* CFSR bit 20 = UFSR.STKOF (stack-overflow UsageFault, Armv8-M Mainline only).
+ * Set by the CPU when an instruction would push SP below MSPLIM/PSPLIM. */
+#define CFSR_UFSR_STKOF         (1U << 20)
+
+/* Stack-overflow source discriminator stored in scratch[2] for FAULT_TYPE_STACK_OVF.
+ * 0 = FreeRTOS pattern-check at context switch; 1 = Cortex-M33 hardware STKOF. */
+#define STK_OVF_SOURCE_FREERTOS 0U
+#define STK_OVF_SOURCE_STKOF    1U
+
+/* Kernel-internal pointer to the currently-running task's TCB. We only
+ * dereference it via pcTaskGetName() and we guard against NULL (the scheduler
+ * may not be running yet when a fault fires), so reading it from a fault
+ * context is safe. Declared here to avoid pulling TCB_t into this file. */
+extern TaskHandle_t volatile pxCurrentTCB;
 
 /*******************************************************************************/
 /*                       STATIC FUNCTION DECLARATIONS                          */
@@ -441,6 +463,35 @@ __attribute__((noreturn, used)) void FaultHandler_HardFaultC(uint32_t *frame)
     const uint32_t cfsr = *(volatile uint32_t *)SCB_CFSR_ADDR;
     const uint32_t hfsr = *(volatile uint32_t *)SCB_HFSR_ADDR;
 
+    /* Armv8-M Mainline hardware stack-overflow trap. The Cortex-M33 has
+     * MSPLIM/PSPLIM stack-limit registers; the FreeRTOS port sets PSPLIM to
+     * each task's stack base on context switch, so when a recursion or large
+     * local would push SP below the base, the CPU raises a UsageFault with
+     * CFSR.UFSR.STKOF set. This fires synchronously, in nanoseconds - long
+     * before FreeRTOS's configCHECK_FOR_STACK_OVERFLOW=2 pattern check would
+     * notice at the next context switch.
+     *
+     * In this case the PC/LR words the CPU tried to stack are unreliable
+     * (the stacking itself failed below the limit), so falling through to
+     * the normal HardFault path would print a misleading "PC=0xa5a5a5a5".
+     * Instead we re-route to the stack-overflow record format, label the
+     * source as STKOF, and capture the running task's name so the report
+     * stays accurate. */
+    if (cfsr & CFSR_UFSR_STKOF)
+    {
+        const char *name = (pxCurrentTCB != NULL) ? pcTaskGetName(NULL) : NULL;
+
+        watchdog_hw->scratch[1] = FAULT_TAG(FAULT_TYPE_STACK_OVF);
+        watchdog_hw->scratch[2] = STK_OVF_SOURCE_STKOF;
+        watchdog_hw->scratch[3] = pack_first4(name);
+
+        emit_raw("\n[FAULT] Stack overflow (hardware STKOF) in task '");
+        emit_raw((name != NULL) ? name : "?");
+        emit_raw("'\n");
+
+        reboot_now();
+    }
+
     watchdog_hw->scratch[1] = FAULT_TAG(FAULT_TYPE_HARDFAULT);
     watchdog_hw->scratch[2] = pc;
     watchdog_hw->scratch[3] = lr;
@@ -490,13 +541,22 @@ void FaultHandler_ReportLastCrash(void)
             
         case FAULT_TYPE_STACK_OVF:
         {
-            /* data2 holds first 4 chars of task name as packed ASCII. */
+            /* data1 holds the source discriminator (FreeRTOS pattern check vs
+             * Cortex-M33 hardware STKOF); data2 holds first 4 chars of task
+             * name as packed ASCII. */
             char name[5] = {0};
             for (int i = 0; i < 4; i++)
             {
                 name[i] = (char)((data2 >> (i * 8)) & 0xFFU);
             }
-            printf("Type: Stack overflow\n");
+            if (data1 == STK_OVF_SOURCE_STKOF)
+            {
+                printf("Type: Stack overflow (hardware STKOF)\n");
+            }
+            else
+            {
+                printf("Type: Stack overflow\n");
+            }
             printf("Task name starts with: '%s'\n", name);
             break;
         }
@@ -532,7 +592,7 @@ __attribute__((noreturn)) void FaultHandler_RecordAssert(const char *file, uint3
 __attribute__((noreturn)) void FaultHandler_RecordStackOverflow(const char *task_name)
 {
     watchdog_hw->scratch[1] = FAULT_TAG(FAULT_TYPE_STACK_OVF);
-    watchdog_hw->scratch[2] = 0;
+    watchdog_hw->scratch[2] = STK_OVF_SOURCE_FREERTOS;
     watchdog_hw->scratch[3] = pack_first4(task_name);
 
     printf("[FAULT] Stack overflow in task '%s'\n",
