@@ -71,6 +71,7 @@
 
 /* Misc includes */
 #include "Common.h"
+#include "FaultInject.h"
 
 /* Blinds includes */
 #include "blinds_controller.h"
@@ -272,6 +273,10 @@ void OS_start( void )
     /* Check FW version */
     uint32_t current_version = check_current_fw_version();
     LOG("Current firmware version: %lu \n", current_version);
+
+	/* Debug-only: spawn the fault-injection task if FAULT_INJECT_KIND != NONE.
+	 * Compiled to a no-op in production builds. */
+	FaultInject_Start();
 
 	LOG("RTOS configuration finished, starting the scheduler... \n");
 	vTaskStartScheduler();

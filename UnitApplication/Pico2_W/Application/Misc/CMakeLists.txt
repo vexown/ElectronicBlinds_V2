@@ -5,6 +5,7 @@ message("########## Misc/CMakeLists.txt - start ##########")
 set(MISC_SOURCE_FILES
     ${CMAKE_CURRENT_SOURCE_DIR}/Source/Common.c
     ${CMAKE_CURRENT_SOURCE_DIR}/Source/FaultHandler.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/Source/FaultInject.c
     )
 
 # Define the path to the include directory for Misc
