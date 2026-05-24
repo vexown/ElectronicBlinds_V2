@@ -77,6 +77,14 @@ int main(void)
 {
     setupHardware();
     FaultHandler_ReportLastCrash();
+
+    /* This delay is mostly for the dual-bank SWD flashing, where the app starts to run after Bank A is flashed, 
+     * but the Bank B is still being flashed causing unpredictable behavior (like blinds not stopping at the edge sensors and ramming into the hardware).
+     * With this delay, we can ensure that the flashing process is fully completed before the app starts running (assuming it takes up to 5 sec, which is reasonable) 
+     * The electronic blinds program is not something that needs a very fast startup time so this solution is acceptable. 
+     * If you ever decide you DO want a fast startup, find a more clever solution to handle this */
+    sleep_ms(5000);
+    
     OS_start();
 }
 
