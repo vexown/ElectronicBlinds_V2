@@ -600,6 +600,8 @@ static void handle_sun_control(bool at_top, bool at_bottom)
 
 static void sun_poll_lux(void)
 {
+    static uint8_t log_counter = 0;
+
     s_sun_poll_count++;
     if (s_sun_poll_count < BLINDS_SUN_POLL_CALLS) return;
 
@@ -608,6 +610,12 @@ static void sun_poll_lux(void)
     if (VEML7700_GetLuxCorrected(&lux) != VEML7700_OK) return;
 
     s_sun_lux = lux;
+
+    log_counter++;
+    if (log_counter % 20 == 0) // log the lux level from time to time for debugging purposes
+    {
+        LOG("[Sun] Current lux level: %d \n", (int)s_sun_lux); 
+    }
 
     /* Update stable-duration counters. Both reset on a direction change or when
      * lux is in the hysteresis band — ensuring a full BLINDS_SUN_STABLE_TIME_S
