@@ -598,6 +598,25 @@ static void handle_sun_control(bool at_top, bool at_bottom)
     }
 }
 
+/**
+ * @brief Throttled VEML7700 read and stable-condition counter update.
+ *
+ * Invoked every call from handle_sun_control(), but only performs an I2C
+ * read once every BLINDS_SUN_POLL_CALLS calls (≈ BLINDS_SUN_POLL_TIME_MS).
+ * On a successful read it updates s_sun_lux and advances one of the
+ * stable-condition counters:
+ *   - s_lux_high_stable_polls — incremented when lux ≥ threshold,
+ *   - s_lux_low_stable_polls  — incremented when lux <  (threshold − hysteresis),
+ *   - both reset when lux sits inside the hysteresis band.
+ * The counters drive the lux_high / lux_low decisions in
+ * handle_sun_control() and require SUN_STABLE_POLLS consecutive readings
+ * (≈ BLINDS_SUN_STABLE_TIME_S) before a state transition can fire — this
+ * suppresses spurious triggers from passing clouds, headlights, etc.
+ *
+ * A failed I2C read is silently skipped (no counter movement, no state
+ * change), so transient sensor glitches do not corrupt the stability
+ * window.
+ */
 static void sun_poll_lux(void)
 {
     static uint8_t log_counter = 0;
@@ -638,8 +657,26 @@ static void sun_poll_lux(void)
     }
 }
 
-/* Returns true and clears the event when night begins during an active sun
- * event, so the auto schedule can take over immediately. */
+/**
+ * @brief Cancel an in-progress sun event when the schedule rolls into night.
+ *
+ * Without this hook, a sun event that started near sunset can outlive the
+ * daytime window: during twilight the lux may linger in the hysteresis band
+ * (neither high-stable nor low-stable), leaving the state machine stuck at
+ * AT_HALFWAY. While the sun state is non-IDLE, handle_auto_control() refuses
+ * to drive the blinds to the night position — so the blinds would remain at
+ * halfway well into the night. Worse, if lux finally drops, RETURNING would
+ * restore the (daytime) saved position, fighting the night schedule.
+ *
+ * On a daytime→night transition while in GOING_DOWN / AT_HALFWAY / RETURNING,
+ * this function stops any active motion, clears the saved position, resets
+ * the stable-condition counters, and forces the sun state to IDLE so the
+ * auto scheduler can immediately take over.
+ *
+ * @return true if the event was preempted (caller should skip the per-state
+ *         handler this cycle); false if no action was needed (already idle
+ *         or still daytime).
+ */
 static bool sun_preempt_for_night(void)
 {
     if (s_sun_state == SUN_STATE_IDLE || s_sun_state == SUN_STATE_CANCELLED)
@@ -656,6 +693,25 @@ static bool sun_preempt_for_night(void)
     return true;
 }
 
+/**
+ * @brief SUN_STATE_IDLE handler — arm a sun event when conditions are right.
+ *
+ * All of the following must hold before the event fires:
+ *   - lux_high is true (≥ threshold, stable for SUN_STABLE_POLLS),
+ *   - mode is AUTO (don't fight the user during manual operation),
+ *   - motor is idle (don't preempt an active manual/auto/double-tap run),
+ *   - dead-reckoned position is known (so we have something to restore later),
+ *   - current position is strictly above the halfway target (otherwise
+ *     "lowering" would actually raise the blinds, which is wrong).
+ *
+ * When all conditions pass, the current position is captured into
+ * s_sun_saved_position, the state advances to GOING_DOWN, and the motor
+ * starts moving down toward BLINDS_SUN_HALFWAY_PERMILLE.
+ *
+ * @param lux_high   Result of the stable-lux-high check from handle_sun_control().
+ * @param at_top     Top limit switch state, forwarded to start_motion().
+ * @param at_bottom  Bottom limit switch state, forwarded to start_motion().
+ */
 static void sun_idle(bool lux_high, bool at_top, bool at_bottom)
 {
     if (!lux_high
@@ -676,6 +732,22 @@ static void sun_idle(bool lux_high, bool at_top, bool at_bottom)
         (unsigned)s_sun_saved_position);
 }
 
+/**
+ * @brief SUN_STATE_GOING_DOWN handler — drive to halfway, or cancel on input.
+ *
+ * Two outcomes per cycle:
+ *   - If a manual button event flipped the mode to MANUAL since the last
+ *     cycle, handle_manual_buttons() will already have stopped the motor —
+ *     this handler only needs to update the state to CANCELLED so the user
+ *     stays in control until lux clears.
+ *   - Otherwise, when the dead-reckoned position has reached (or passed
+ *     downward) BLINDS_SUN_HALFWAY_PERMILLE, the motor is stopped and the
+ *     state advances to AT_HALFWAY to wait for lux to drop.
+ *
+ * Note: the position check requires a known position. If it ever becomes
+ * UNKNOWN mid-motion (e.g. a watchdog trip during the move) the latch in
+ * handle_sun_control() will already have blocked re-entry.
+ */
 static void sun_going_down(void)
 {
     if (s_mode == BLINDS_MODE_MANUAL)
@@ -695,6 +767,26 @@ static void sun_going_down(void)
     }
 }
 
+/**
+ * @brief SUN_STATE_AT_HALFWAY handler — wait at halfway, then return or end.
+ *
+ * The blinds sit at BLINDS_SUN_HALFWAY_PERMILLE with the motor idle. Three
+ * outcomes are possible:
+ *   - Manual input → state becomes CANCELLED (user takes over until lux clears).
+ *   - lux_low (stable below threshold − hysteresis): if a usable
+ *     s_sun_saved_position is recorded (> halfway), state advances to
+ *     RETURNING and the motor drives back up; otherwise the event simply
+ *     ends with the blinds left at halfway and state → IDLE.
+ *   - Neither: do nothing this cycle.
+ *
+ * The "no valid saved position" branch is defensive — under normal entry
+ * via sun_idle() the saved position is always > halfway, but a watchdog
+ * trip mid-event could have cleared it.
+ *
+ * @param lux_low    Result of the stable-lux-low check from handle_sun_control().
+ * @param at_top     Top limit switch state, forwarded to start_motion().
+ * @param at_bottom  Bottom limit switch state, forwarded to start_motion().
+ */
 static void sun_at_halfway(bool lux_low, bool at_top, bool at_bottom)
 {
     if (s_mode == BLINDS_MODE_MANUAL)
@@ -721,6 +813,18 @@ static void sun_at_halfway(bool lux_low, bool at_top, bool at_bottom)
     }
 }
 
+/**
+ * @brief SUN_STATE_RETURNING handler — drive back to the saved position.
+ *
+ * Stops the upward motion and ends the event under either of:
+ *   - The top limit switch is active (catches the case where the saved
+ *     position was already at the top, or position tracking has overshot).
+ *   - The dead-reckoned position has reached or exceeded s_sun_saved_position.
+ * On completion the saved position is cleared and the state returns to IDLE.
+ * A manual button event during the return cancels the event.
+ *
+ * @param at_top  Top limit switch state — early-terminates the return.
+ */
 static void sun_returning(bool at_top)
 {
     if (s_mode == BLINDS_MODE_MANUAL)
@@ -740,6 +844,19 @@ static void sun_returning(bool at_top)
     }
 }
 
+/**
+ * @brief SUN_STATE_CANCELLED handler — re-arm once the sun has cleared.
+ *
+ * The state machine lands here whenever the user interrupts a sun event with
+ * a manual button press. It is a "do not retrigger" latch: the same bright
+ * lux that caused the original event must not immediately reissue it after
+ * the user has expressed a preference. Re-arming requires lux to drop below
+ * (threshold − hysteresis) for SUN_STABLE_POLLS consecutive reads, at which
+ * point the state returns to IDLE and a *future* high-lux event is allowed
+ * to fire again.
+ *
+ * @param lux_low  Result of the stable-lux-low check from handle_sun_control().
+ */
 static void sun_cancelled(bool lux_low)
 {
     if (lux_low)
@@ -808,16 +925,32 @@ static void handle_auto_control(bool at_top, bool at_bottom)
 
 /* --- Motor helpers --------------------------------------------------------- */
 
+/**
+ * @brief Thin H-bridge wrapper: drive both motor outputs to coast/brake.
+ *
+ * Does not touch state-machine variables — call stop_motion() instead if
+ * the controller's view of the motor needs to update too.
+ */
 static void motor_stop(void)
 {
     HBridge_Stop();
 }
 
+/**
+ * @brief Thin H-bridge wrapper: energise the motor in the UP direction at
+ *        BLINDS_MOTOR_SPEED. Caller is responsible for state bookkeeping
+ *        (use start_motion() rather than calling this directly).
+ */
 static void motor_start_up(void)
 {
     HBridge_SetSpeed((uint8_t)BLINDS_MOTOR_SPEED, BLINDS_MOTOR_DIR_UP);
 }
 
+/**
+ * @brief Thin H-bridge wrapper: energise the motor in the DOWN direction at
+ *        BLINDS_MOTOR_SPEED. Caller is responsible for state bookkeeping
+ *        (use start_motion() rather than calling this directly).
+ */
 static void motor_start_down(void)
 {
     HBridge_SetSpeed((uint8_t)BLINDS_MOTOR_SPEED, BLINDS_MOTOR_DIR_DOWN);
