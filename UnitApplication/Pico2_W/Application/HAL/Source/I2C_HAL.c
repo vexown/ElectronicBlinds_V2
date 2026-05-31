@@ -18,10 +18,23 @@
 #define I2C_SEND_STOP       false  // Sends a Stop condition at the end of the transfer to release the bus
 #define I2C_SEND_RESTART    true   // Retains control of the bus and sends a Restart instead of a Stop allowing to send more data right away
 
+/* Bus recovery: when a stuck slave holds SDA low the peripheral cannot issue a START,
+ * so every transfer fails until the line is freed. After this many consecutive failures
+ * on a bus we bit-bang a recovery sequence to clock the slave out of its hung state. */
+#define I2C_RECOVERY_FAIL_THRESHOLD 3U
+#define I2C_RECOVERY_CLOCK_PULSES   9U   // One extra clock beyond a full byte to flush the slave
+#define I2C_RECOVERY_HALF_PERIOD_US 5U   // ~100 kHz while bit-banging the recovery clock
+
 /*******************************************************************************/
 /*                             STATIC VARIABLES                                */
 /*******************************************************************************/
 static bool s_initialized[2] = {false, false};
+
+/* Last configuration used per instance, kept so bus recovery knows the pins/speed */
+static I2C_Config s_config[2];
+
+/* Consecutive transfer failures per instance, used to trigger automatic recovery */
+static uint8_t s_consecutive_fails[2] = {0U, 0U};
 
 /*******************************************************************************/
 /*                        STATIC FUNCTION DEFINITIONS                          */
@@ -106,8 +119,36 @@ I2C_Status I2C_Init(const I2C_Config* config)
     gpio_pull_up(config->sda_pin);
     gpio_pull_up(config->scl_pin);
 
+    s_config[config->instance] = *config;   // Remembered so bus recovery can re-create the setup
     s_initialized[config->instance] = true; // this works because the I2C instances are enumerated from 0 to 1, so we can use the instance value as an index in the array
     return I2C_OK;
+}
+
+/* Description: Record the outcome of a data transfer and trigger automatic bus recovery
+ *              after too many consecutive failures on the given instance. A stuck slave
+ *              holding SDA low takes down the whole bus (every device on it), so recovery
+ *              is keyed off the bus, not an individual device.
+ * Parameters:
+ * 	- instance: the I2C instance the transfer ran on
+ * 	- status:   the result of the transfer
+ * Returns: the same status that was passed in (pass-through for convenient use at return sites)
+ */
+static I2C_Status i2c_note_outcome(I2C_Instance instance, I2C_Status status)
+{
+    if (status == I2C_OK)
+    {
+        s_consecutive_fails[instance] = 0U;
+    }
+    else
+    {
+        if (s_consecutive_fails[instance] < 0xFFU) s_consecutive_fails[instance]++;
+
+        if (s_consecutive_fails[instance] >= I2C_RECOVERY_FAIL_THRESHOLD)
+        {
+            (void)I2C_RecoverBus(instance); // Resets the failure counter on completion
+        }
+    }
+    return status;
 }
 
 /* Description: Write a single byte to a specific register of the I2C device
@@ -127,15 +168,20 @@ I2C_Status I2C_WriteByte(I2C_Instance instance, uint8_t dev_addr, uint8_t reg_ad
     
     int status = i2c_write_timeout_us(i2c, dev_addr, buffer, sizeof(buffer), I2C_SEND_STOP, I2C_TIMEOUT_US);
 
-    switch (status) 
+    I2C_Status result;
+    switch (status)
     {
         case PICO_ERROR_GENERIC:
-            return I2C_ERROR_WRITE_FAILED;
+            result = I2C_ERROR_WRITE_FAILED;
+            break;
         case PICO_ERROR_TIMEOUT:
-            return I2C_ERROR_WRITE_TIMEOUT;
+            result = I2C_ERROR_WRITE_TIMEOUT;
+            break;
         default:
-            return I2C_OK;
+            result = I2C_OK;
+            break;
     }
+    return i2c_note_outcome(instance, result);
 }
 
 /* Description: Read a single byte from a specific register of the I2C device
@@ -160,25 +206,25 @@ I2C_Status I2C_ReadByte(I2C_Instance instance, uint8_t dev_addr, uint8_t reg_add
     int status = i2c_write_timeout_us(i2c, dev_addr, buffer, sizeof(buffer), I2C_SEND_RESTART, I2C_TIMEOUT_US);
 
     if (status == PICO_ERROR_GENERIC) {
-        return I2C_ERROR_WRITE_FAILED;
+        return i2c_note_outcome(instance, I2C_ERROR_WRITE_FAILED);
     }
     else if (status == PICO_ERROR_TIMEOUT) {
-        return I2C_ERROR_WRITE_TIMEOUT;
+        return i2c_note_outcome(instance, I2C_ERROR_WRITE_TIMEOUT);
     }
 
     /* Step 2: Read the data from the device
        After the register address has been sent, we can now read the data from that register.
        The master sends a read command, and the slave responds by sending the requested data. */
     status = i2c_read_timeout_us(i2c, dev_addr, data, 1, I2C_SEND_STOP, I2C_TIMEOUT_US);
-    
+
     if (status == PICO_ERROR_GENERIC) {
-        return I2C_ERROR_READ_FAILED;
+        return i2c_note_outcome(instance, I2C_ERROR_READ_FAILED);
     }
     else if (status == PICO_ERROR_TIMEOUT) {
-        return I2C_ERROR_READ_TIMEOUT;
+        return i2c_note_outcome(instance, I2C_ERROR_READ_TIMEOUT);
     }
 
-    return I2C_OK;
+    return i2c_note_outcome(instance, I2C_OK);
 }
 
 
@@ -203,18 +249,23 @@ I2C_Status I2C_WriteMultiple(I2C_Instance instance, uint8_t dev_addr, uint8_t re
     memcpy(buffer + 1, data, length);
 
     int status = i2c_write_timeout_us(i2c, dev_addr, buffer, length + 1, I2C_SEND_STOP, I2C_TIMEOUT_US);
-    
-    switch (status) 
+
+    I2C_Status result;
+    switch (status)
     {
         case PICO_ERROR_GENERIC:
-            return I2C_ERROR_WRITE_FAILED;
-        
+            result = I2C_ERROR_WRITE_FAILED;
+            break;
+
         case PICO_ERROR_TIMEOUT:
-            return I2C_ERROR_WRITE_TIMEOUT;
-        
+            result = I2C_ERROR_WRITE_TIMEOUT;
+            break;
+
         default:
-            return I2C_OK;  // Success if no error
+            result = I2C_OK;  // Success if no error
+            break;
     }
+    return i2c_note_outcome(instance, result);
 }
 
 /* Description: Read multiple bytes from a specific register of the I2C device
@@ -239,24 +290,24 @@ I2C_Status I2C_ReadMultiple(I2C_Instance instance, uint8_t dev_addr, uint8_t reg
     int status = i2c_write_timeout_us(i2c, dev_addr, buffer, sizeof(buffer), I2C_SEND_RESTART, I2C_TIMEOUT_US);
 
     if (status == PICO_ERROR_GENERIC) {
-        return I2C_ERROR_WRITE_FAILED;
+        return i2c_note_outcome(instance, I2C_ERROR_WRITE_FAILED);
     }
     else if (status == PICO_ERROR_TIMEOUT) {
-        return I2C_ERROR_WRITE_TIMEOUT;
+        return i2c_note_outcome(instance, I2C_ERROR_WRITE_TIMEOUT);
     }
 
     /* Step 2: Read the multiple consecutive registers
        The device will return the requested number of bytes starting from the register address provided. */
     status = i2c_read_timeout_us(i2c, dev_addr, data, length, I2C_SEND_STOP, I2C_TIMEOUT_US);
-    
+
     if (status == PICO_ERROR_GENERIC) {
-        return I2C_ERROR_READ_FAILED;
+        return i2c_note_outcome(instance, I2C_ERROR_READ_FAILED);
     }
     else if (status == PICO_ERROR_TIMEOUT) {
-        return I2C_ERROR_READ_TIMEOUT;
+        return i2c_note_outcome(instance, I2C_ERROR_READ_TIMEOUT);
     }
 
-    return I2C_OK;
+    return i2c_note_outcome(instance, I2C_OK);
 }
 
 /* Description: Write multiple bytes to an I2C device that uses a 16-bit register address.
@@ -281,17 +332,22 @@ I2C_Status I2C_WriteMultiple16(I2C_Instance instance, uint8_t dev_addr, uint16_t
 
     int status = i2c_write_timeout_us(i2c, dev_addr, buffer, length + 2, I2C_SEND_STOP, I2C_TIMEOUT_US);
 
+    I2C_Status result;
     switch (status)
     {
         case PICO_ERROR_GENERIC:
-            return I2C_ERROR_WRITE_FAILED;
+            result = I2C_ERROR_WRITE_FAILED;
+            break;
 
         case PICO_ERROR_TIMEOUT:
-            return I2C_ERROR_WRITE_TIMEOUT;
+            result = I2C_ERROR_WRITE_TIMEOUT;
+            break;
 
         default:
-            return I2C_OK;
+            result = I2C_OK;
+            break;
     }
+    return i2c_note_outcome(instance, result);
 }
 
 /* Description: Read multiple bytes from an I2C device that uses a 16-bit register address.
@@ -316,11 +372,11 @@ I2C_Status I2C_ReadMultiple16(I2C_Instance instance, uint8_t dev_addr, uint16_t 
 
     if (status == PICO_ERROR_GENERIC)
     {
-        return I2C_ERROR_WRITE_FAILED;
+        return i2c_note_outcome(instance, I2C_ERROR_WRITE_FAILED);
     }
     else if (status == PICO_ERROR_TIMEOUT)
     {
-        return I2C_ERROR_WRITE_TIMEOUT;
+        return i2c_note_outcome(instance, I2C_ERROR_WRITE_TIMEOUT);
     }
 
     /* Step 2: Read the requested bytes; the device auto-increments its address counter */
@@ -328,14 +384,14 @@ I2C_Status I2C_ReadMultiple16(I2C_Instance instance, uint8_t dev_addr, uint16_t 
 
     if (status == PICO_ERROR_GENERIC)
     {
-        return I2C_ERROR_READ_FAILED;
+        return i2c_note_outcome(instance, I2C_ERROR_READ_FAILED);
     }
     else if (status == PICO_ERROR_TIMEOUT)
     {
-        return I2C_ERROR_READ_TIMEOUT;
+        return i2c_note_outcome(instance, I2C_ERROR_READ_TIMEOUT);
     }
 
-    return I2C_OK;
+    return i2c_note_outcome(instance, I2C_OK);
 }
 
 /* Description: Check if the I2C of the specified address exists on the bus and is ready to communicate
@@ -397,4 +453,77 @@ I2C_Status I2C_ScanBus(I2C_Instance instance, I2C_DeviceList *device_list)
     }
 
     return I2C_OK;
+}
+
+/* Description: Recover a hung I2C bus where a slave is holding SDA low.
+ *              This happens when a slave loses sync mid-byte (e.g. a glitch on SCL): it keeps
+ *              waiting for clock pulses and pins SDA low, which prevents the master from ever
+ *              issuing a START, so every transfer on the bus fails. Re-initialising the
+ *              peripheral does not help because it cannot drive a START while SDA is held low.
+ *              The fix is to temporarily bit-bang the lines: clock SCL up to 9 times so the
+ *              stuck slave finishes its phantom byte and releases SDA, then issue a manual STOP.
+ * Parameters:
+ * 	- instance: the I2C instance to recover (must have been initialised with I2C_Init)
+ * Returns: I2C_OK if SDA was released and the bus is free again,
+ *          I2C_ERROR_INVALID_INSTANCE / I2C_ERROR_INIT_FAILED otherwise
+ */
+I2C_Status I2C_RecoverBus(I2C_Instance instance)
+{
+    if (instance != I2C_INSTANCE_0 && instance != I2C_INSTANCE_1) return I2C_ERROR_INVALID_INSTANCE;
+    if (!s_initialized[instance]) return I2C_ERROR_INIT_FAILED;
+
+    const I2C_Config* cfg = &s_config[instance];
+    i2c_inst_t* i2c = get_i2c_inst(instance);
+    const uint8_t sda = cfg->sda_pin;
+    const uint8_t scl = cfg->scl_pin;
+
+    /* Detach the peripheral so we can drive the lines manually as GPIO */
+    i2c_deinit(i2c);
+
+    gpio_set_function(sda, GPIO_FUNC_SIO);
+    gpio_set_function(scl, GPIO_FUNC_SIO);
+    gpio_pull_up(sda);   // Keep pull-ups so a released line idles high
+    gpio_pull_up(scl);
+
+    /* Start from a known state: SDA released (input), SCL driven high */
+    gpio_set_dir(sda, GPIO_IN);
+    gpio_put(scl, 1);
+    gpio_set_dir(scl, GPIO_OUT);
+    busy_wait_us(I2C_RECOVERY_HALF_PERIOD_US);
+
+    /* Clock until the slave releases SDA, up to 9 pulses (a full byte + ACK slot) */
+    bool sda_released = gpio_get(sda);
+    for (uint8_t i = 0U; (i < I2C_RECOVERY_CLOCK_PULSES) && !sda_released; i++)
+    {
+        gpio_put(scl, 0);
+        busy_wait_us(I2C_RECOVERY_HALF_PERIOD_US);
+        gpio_put(scl, 1);
+        busy_wait_us(I2C_RECOVERY_HALF_PERIOD_US);
+        sda_released = gpio_get(sda);
+    }
+
+    /* Issue a manual STOP condition (SDA low -> high while SCL is high) to reset
+       any slave's internal state machine and leave the bus idle */
+    gpio_put(scl, 0);
+    gpio_set_dir(sda, GPIO_OUT);
+    gpio_put(sda, 0);
+    busy_wait_us(I2C_RECOVERY_HALF_PERIOD_US);
+    gpio_put(scl, 1);
+    busy_wait_us(I2C_RECOVERY_HALF_PERIOD_US);
+    gpio_put(sda, 1);
+    busy_wait_us(I2C_RECOVERY_HALF_PERIOD_US);
+
+    /* Release SDA before handing the pins back to the peripheral */
+    gpio_set_dir(sda, GPIO_IN);
+
+    /* Re-attach the I2C peripheral */
+    (void)i2c_init(i2c, cfg->speed_hz);
+    gpio_set_function(sda, GPIO_FUNC_I2C);
+    gpio_set_function(scl, GPIO_FUNC_I2C);
+    gpio_pull_up(sda);
+    gpio_pull_up(scl);
+
+    s_consecutive_fails[instance] = 0U;
+
+    return sda_released ? I2C_OK : I2C_ERROR_INIT_FAILED;
 }

@@ -116,4 +116,10 @@ I2C_Status I2C_IsDeviceReady(I2C_Instance instance, uint8_t dev_addr);
 /* Scan for devices on the I2C bus */
 I2C_Status I2C_ScanBus(I2C_Instance instance, I2C_DeviceList *device_list);
 
+/* Recover a hung bus where a slave is holding SDA low: bit-bangs up to 9 SCL pulses to free
+ * the line, then issues a STOP and re-initialises the peripheral. Called automatically after
+ * repeated transfer failures, but also exposed for manual use. Returns I2C_OK if the bus was
+ * freed. */
+I2C_Status I2C_RecoverBus(I2C_Instance instance);
+
 #endif // I2C_HAL_H
