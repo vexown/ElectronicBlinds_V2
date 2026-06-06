@@ -8,7 +8,7 @@
  * Bump these three numbers by hand for each release (semantic versioning:
  * MAJOR.MINOR.PATCH). The value is baked into the image at build time */
 #define FW_VERSION_MAJOR  1
-#define FW_VERSION_MINOR  1
+#define FW_VERSION_MINOR  2
 #define FW_VERSION_PATCH  0
 
 /* Packed 0x00MMmmpp encoding stored in boot metadata. */
