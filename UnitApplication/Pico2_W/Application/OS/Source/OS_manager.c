@@ -68,6 +68,7 @@
 #include "flash_layout.h"
 #include "flash_operations.h"
 #include "metadata.h"
+#include "fw_version.h"
 
 /* Misc includes */
 #include "Common.h"
@@ -270,9 +271,29 @@ void OS_start( void )
         LOG("Invalid bank (0xFF) \n"); // we should never get here, bootloader shall not allow to boot with invalid bank in metadata
     }
 
-    /* Check FW version */
-    uint32_t current_version = check_current_fw_version();
-    LOG("Current firmware version: %lu \n", current_version);
+    /* Report the version compiled into this image (the source of truth). */
+    LOG("Current firmware version: %s \n", FW_VERSION_STR);
+
+    /* Keep the boot metadata in sync with the running image so the field stays
+     * meaningful for the bootloader (future anti-rollback). Only rewrite flash
+     * when it actually differs — e.g. on the first boot after an OTA update —
+     * to avoid needless flash wear on every reset. */
+    if (check_current_fw_version() != FW_VERSION)
+    {
+        boot_metadata_t meta;
+        if (read_metadata_from_flash(&meta))
+        {
+            meta.version = FW_VERSION;
+            if (write_metadata_to_flash(&meta))
+            {
+                LOG("Boot metadata version synced to %s \n", FW_VERSION_STR);
+            }
+            else
+            {
+                LOG("Failed to sync boot metadata version \n");
+            }
+        }
+    }
 
 	/* Debug-only: spawn the fault-injection task if FAULT_INJECT_KIND != NONE.
 	 * Compiled to a no-op in production builds. */

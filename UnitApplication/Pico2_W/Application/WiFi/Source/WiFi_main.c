@@ -31,6 +31,7 @@
 #include "flash_layout.h"
 #include "flash_operations.h"
 #include "metadata.h"
+#include "fw_version.h"
 
 /* Misc includes */
 #include "Common.h"
@@ -159,10 +160,9 @@ static void WiFi_ProcessCommand(uint8_t command)
         {
             LOG("Show firmware version command received\n");
             uint8_t active_bank = check_active_bank();
-            uint32_t fw_version = check_current_fw_version();
             char fw_info[64];
             const char *bank_str = (active_bank == BANK_A) ? "A" : (active_bank == BANK_B) ? "B" : "Unknown";
-            snprintf(fw_info, sizeof(fw_info), "FW Version: %lu, Active Bank: %s\n", (unsigned long)fw_version, bank_str);
+            snprintf(fw_info, sizeof(fw_info), "FW Version: %s, Active Bank: %s\n", FW_VERSION_STR, bank_str);
             (void)tcp_send(fw_info, (uint16_t)strlen(fw_info));
             break;
         }
@@ -330,8 +330,7 @@ static void WiFi_UpdateState(void)
         if (read_metadata_from_flash(&current_metadata)) 
         {
             current_metadata.update_pending = true;
-            current_metadata.version++; // Increment version for the new firmware
-            if (write_metadata_to_flash(&current_metadata)) 
+            if (write_metadata_to_flash(&current_metadata))
             {
                 /* Verify the write by reading back */
                 boot_metadata_t verify_metadata;
@@ -349,7 +348,7 @@ static void WiFi_UpdateState(void)
             /* Attempt to recover by erasing the metadata and writing a clean one */
             current_metadata.magic = BOOT_METADATA_MAGIC;
             current_metadata.active_bank = BANK_A;
-            current_metadata.version = 0;
+            current_metadata.version = FW_VERSION;
             current_metadata.app_size = 0;
             current_metadata.app_crc = 0;
             current_metadata.update_pending = true;
