@@ -211,7 +211,7 @@
  * When the VEML7700 reads at or above this value the blinds are automatically
  * lowered to BLINDS_SUN_HALFWAY_PERMILLE. 
  */
-#define BLINDS_SUN_LUX_THRESHOLD       2300.0f
+#define BLINDS_SUN_LUX_THRESHOLD       2200.0f
 
 /**
  * @brief Hysteresis band (lux) below the threshold for the return trip.
@@ -220,7 +220,7 @@
  * (BLINDS_SUN_LUX_THRESHOLD - BLINDS_SUN_LUX_HYSTERESIS). Prevents
  * rapid toggling when illuminance hovers near the trigger point.
  */
-#define BLINDS_SUN_LUX_HYSTERESIS      300.0f
+#define BLINDS_SUN_LUX_HYSTERESIS      400.0f
 
 /**
  * @brief Sun-position target as a per-mille fraction of the travel range.
