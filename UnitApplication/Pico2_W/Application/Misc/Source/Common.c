@@ -12,11 +12,27 @@
 
 /* Kernel includes */
 #include "FreeRTOS.h"
-#include "task.h"   
+#include "task.h"
+
+/* Pico SDK includes */
+#include "pico/stdlib.h"        /* busy_wait_ms() */
+#include "hardware/watchdog.h"  /* watchdog_update() */
 
 /* Misc includes */
 #include "Common.h"
 #include "FaultHandler.h"
+
+/*******************************************************************************/
+/*                                  MACROS                                     */
+/*******************************************************************************/
+
+/* Parked-state loop timing. We feed the watchdog every CRIT_PARK_TICK_MS, which
+ * MUST stay below WATCHDOG_TIMEOUT_MS (2000 ms) so the board stays parked instead
+ * of reset-looping, while still being rescued if this very loop ever wedges.
+ * The reason line is re-emitted every CRIT_PARK_REPRINT_TICKS ticks (~5 s) so a
+ * UART serial adapter connected at any later time immediately sees what happened. */
+#define CRIT_PARK_TICK_MS           ((uint32_t)250U)
+#define CRIT_PARK_REPRINT_TICKS     ((uint32_t)20U)   /* 20 * 250 ms = ~5 s */
 
 /*******************************************************************************/
 /*                          GLOBAL FUNCTION DEFINITIONS                        */
@@ -35,19 +51,21 @@
  */
 void CriticalErrorHandler(uint8_t moduleId, uint8_t errorId)
 {
-    LOG("CRTICIAL ERROR OCCURED. moduleId: %u, errorId: %u. Going into endless loop...\n", moduleId, errorId);
+    uint32_t ticks = 0;
 
-    /* Enter a critical section. The idea here is to prevent leaving this endless loop by disabling all interrupts globally.
-    As stated in FreeRTOS documentation:
-        Preemptive context switches only occur inside an interrupt, so will not occur when interrupts are disabled. Therefore, the 
-        task that called taskENTER_CRITICAL() is guaranteed to remain in the Running state until the critical section is exited, 
-        unless the task explicitly attempts to block or yield (which it should not do from inside a critical section). */ 
-    taskENTER_CRITICAL();
-    
-    /* Infinite loop to trap execution */
-    while(1)
+    for ( ;; )
     {
-        /* TODO - You can also add some flashing LEDs or other indicators  */
+#if (WATCHDOG_ENABLED == ON)
+        watchdog_update();
+#endif
+        if ((ticks % CRIT_PARK_REPRINT_TICKS) == 0U)
+        {
+            printf("\n[CRITICAL] PARKED - moduleId=%u errorId=%u - Power-cycle or reflash to recover.\n",
+                  (unsigned)moduleId, (unsigned)errorId);
+        }
+
+        ticks++;
+        busy_wait_ms(CRIT_PARK_TICK_MS);
     }
 }
 
