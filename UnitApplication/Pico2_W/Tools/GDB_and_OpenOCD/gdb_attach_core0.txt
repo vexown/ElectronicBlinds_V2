@@ -1,0 +1,56 @@
+# ****************************************************************************
+# gdb_attach_core0.txt
+#
+# Post-mortem ATTACH script for a LIVE, possibly-frozen target.
+#
+# Unlike gdb_commands_core0.txt this file deliberately does NOT:
+#   - 'monitor reset halt'  (would wipe the very state we want to capture)
+#   - 'load'                (would reflash and reset)
+#   - 'break main' / 'continue'
+#
+# It connects to a running core, halts it exactly where it is, and dumps the
+# information needed to answer "where is it stuck?". Use it the next time the
+# board freezes WITHOUT power-cycling it first.
+# ****************************************************************************
+
+# Connect to the OpenOCD GDB server. 'extended-remote' lets us stay attached
+# even across a 'monitor resume' if we want to poke and continue.
+target extended-remote localhost:3333
+
+# Halt the core where it currently is. NO reset.
+monitor halt
+
+echo \n==================== POST-MORTEM DUMP ====================\n
+
+# Faulting / stuck PC + the full caller chain. If my hypothesis is right and
+# the firmware tripped CriticalErrorHandler, the PC sits in its while(1) and
+# the backtrace names the caller (and therefore the errorId path).
+echo \n---- backtrace (where are we stuck) ----\n
+backtrace full
+
+echo \n---- core registers ----\n
+info registers
+
+# PRIMASK != 0 means interrupts are globally masked — exactly what
+# taskENTER_CRITICAL() in CriticalErrorHandler leaves behind. This single
+# line distinguishes "firmware chose to spin with IRQs off" from a genuine
+# hardware lockup or brownout.
+echo \n---- interrupt-mask / stack-pointer state ----\n
+info registers primask basepri faultmask control msp psp
+
+# Configurable Fault Status Register (0xE000ED28) and HardFault Status
+# Register (0xE000ED2C) — non-zero here means we are parked in/after a fault.
+echo \n---- CFSR @0xE000ED28  /  HFSR @0xE000ED2C ----\n
+x/1xw 0xE000ED28
+x/1xw 0xE000ED2C
+
+# Watchdog scratch regs: [0]=reset count, [1..3]=fault breadcrumb. Lets you
+# read the crash record without rebooting. (WATCHDOG_BASE 0x400d8000,
+# SCRATCH0 at +0x0c on RP2350 -> 0x400d800c.)
+echo \n---- watchdog scratch[0..3] (reset count + breadcrumb) ----\n
+x/4xw 0x400d800c
+
+echo \n==========================================================\n
+echo Inspect freely:  bt | info locals | p <var> | x/<n>x <addr>\n
+echo Let it run again:  monitor resume     Detach:  detach\n
+echo \n
