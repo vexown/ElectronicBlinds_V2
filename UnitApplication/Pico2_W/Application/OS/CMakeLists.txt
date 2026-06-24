@@ -5,6 +5,7 @@ message("########## OS/CMakeLists.txt - start ##########")
 set(OS_SOURCE_FILES
     ${CMAKE_CURRENT_SOURCE_DIR}/Source/OS_manager.c
     ${CMAKE_CURRENT_SOURCE_DIR}/Source/OS_hooks.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/Source/WatchdogSupervisor.c
     )
 
 # Define the path to the include directory for OS
