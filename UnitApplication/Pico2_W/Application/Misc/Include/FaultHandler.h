@@ -205,4 +205,25 @@ __attribute__((noreturn)) void FaultHandler_RecordStackOverflow(const char *task
  */
 __attribute__((noreturn)) void FaultHandler_RecordMallocFailed(void);
 
+/**
+ * @brief Record a watchdog-supervisor stall breadcrumb. Does NOT reboot.
+ *
+ * Called by the watchdog supervisor task when a monitored task's heartbeat
+ * stops advancing past its deadline. Stores:
+ *   - scratch[1] = magic | FAULT_TYPE_WD_STALL
+ *   - scratch[2] = eTaskState of the stalled task at detection (the key
+ *                  discriminator: Blocked = stuck on a resource such as the
+ *                  CYW43 lock; Ready = starved of CPU by a higher-priority task)
+ *   - scratch[3] = first 4 chars of the stalled task name packed as ASCII
+ *
+ * This recorder intentionally does not print or reboot: the supervisor prints
+ * a full live dump itself, then stops petting so the hardware watchdog resets
+ * the board. The breadcrumb only exists so FaultHandler_ReportLastCrash() can
+ * also announce the cause on the next boot if nobody was watching the UART.
+ *
+ * @param task_name   Name of the stalled task; NULL is tolerated.
+ * @param task_state  eTaskState value (cast to uint32_t) of the stalled task.
+ */
+void FaultHandler_RecordWatchdogStall(const char *task_name, uint32_t task_state);
+
 #endif /* FAULT_HANDLER_H */

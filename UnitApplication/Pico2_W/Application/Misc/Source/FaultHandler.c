@@ -39,6 +39,7 @@
 #define FAULT_TYPE_ASSERT       0x002U
 #define FAULT_TYPE_STACK_OVF    0x003U
 #define FAULT_TYPE_MALLOC_FAIL  0x004U
+#define FAULT_TYPE_WD_STALL     0x005U
 
 /* Standard Cortex-M System Control Block registers. Accessed directly to
  * avoid pulling CMSIS into the rest of the codebase. 
@@ -564,7 +565,29 @@ void FaultHandler_ReportLastCrash(void)
         case FAULT_TYPE_MALLOC_FAIL:
             printf("Type: pvPortMalloc failed (out of FreeRTOS heap)\n");
             break;
-            
+
+        case FAULT_TYPE_WD_STALL:
+        {
+            /* data1 = eTaskState of the stalled task at detection time;
+             * data2 = first 4 chars of its name packed as little-endian ASCII.
+             * The state is the key discriminator: a BLOCKED task was stuck
+             * waiting on a resource (e.g. the CYW43 lock); a READY task was
+             * being starved of CPU by a higher-priority hog. */
+            static const char *const stateNames[] =
+                { "Running", "Ready", "Blocked", "Suspended", "Deleted", "Invalid" };
+            char name[5] = {0};
+            for (int i = 0; i < 4; i++)
+            {
+                name[i] = (char)((data2 >> (i * 8)) & 0xFFU);
+            }
+            printf("Type: Watchdog stall (task heartbeat stopped)\n");
+            printf("Stalled task starts with: '%s'\n", name);
+            printf("Task state at stall: %s\n",
+                   (data1 < (sizeof(stateNames) / sizeof(stateNames[0])))
+                       ? stateNames[data1] : "?");
+            break;
+        }
+
         default:
             printf("Type: unknown (0x%lx)\n", (unsigned long)type);
             break;
@@ -610,6 +633,19 @@ __attribute__((noreturn)) void FaultHandler_RecordMallocFailed(void)
     printf("[FAULT] pvPortMalloc returned NULL (FreeRTOS heap exhausted)\n");
 
     reboot_now();
+}
+
+void FaultHandler_RecordWatchdogStall(const char *task_name, uint32_t task_state)
+{
+    /* Unlike the other recorders this one does NOT reboot. The watchdog
+     * supervisor calls it after it has already printed a full live diagnostic
+     * dump, and then deliberately stops petting the watchdog so the hardware
+     * performs the reset. We only leave the compact breadcrumb in scratch[1..3]
+     * so that FaultHandler_ReportLastCrash() can announce the cause on the next
+     * boot too - useful if nobody was watching the UART when the stall hit. */
+    watchdog_hw->scratch[1] = FAULT_TAG(FAULT_TYPE_WD_STALL);
+    watchdog_hw->scratch[2] = task_state;
+    watchdog_hw->scratch[3] = pack_first4(task_name);
 }
 
 /**
