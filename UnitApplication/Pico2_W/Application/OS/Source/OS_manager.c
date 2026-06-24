@@ -50,8 +50,6 @@
 #include "lwip/sockets.h"
 #include "pico/async_context.h"
 #include "hardware/watchdog.h"
-#include "hardware/regs/watchdog.h"
-#include "hardware/structs/watchdog.h"
 
 /* WiFi includes */
 #include "WiFi_UDP.h"
@@ -63,6 +61,7 @@
 
 /* OS includes */
 #include "OS_manager.h"
+#include "WatchdogSupervisor.h"
 
 /* Flash includes */
 #include "flash_layout.h"
@@ -83,6 +82,7 @@
 
 /* Priorities for the tasks (bigger number = higher prio) */
 #define CYW43_INIT_TASK_PRIORITY        	(configMAX_PRIORITIES - 1)  // Highest
+#define WATCHDOG_SUPERVISOR_TASK_PRIORITY	(configMAX_PRIORITIES - 2)  // Above every application task on purpose (see below)
 #define ALIVE_TASK_PRIORITY             	(tskIDLE_PRIORITY + 1) 		// Lowest (but still higher than the idle task)
 #define MONITOR_TASK_PRIORITY				(tskIDLE_PRIORITY + 2)
 #define BLINDS_TASK_PRIORITY				(tskIDLE_PRIORITY + 2)
@@ -98,6 +98,7 @@
 #define WIFI_RETRY_DELAY_TICKS				pdMS_TO_TICKS(30000) //30s
 #define MONITOR_TASK_PERIOD_TICKS			pdMS_TO_TICKS(11000) //11s
 #define BLINDS_TASK_PERIOD_TICKS			pdMS_TO_TICKS(BLINDS_TASK_PERIOD_MS)
+#define WATCHDOG_SUPERVISOR_PERIOD_TICKS	pdMS_TO_TICKS(250)  //250ms - pets the watchdog ~8x per timeout window
 
 /* Stack sizes - This parameter is in WORDS (on Pico W: 1 word = 32bit = 4bytes) */ 
 #define STACK_1024_BYTES					(configSTACK_DEPTH_TYPE)(256) 
@@ -106,9 +107,10 @@
 #define STACK_8192_BYTES					(configSTACK_DEPTH_TYPE)(2048)
 #define STACK_16384_BYTES					(configSTACK_DEPTH_TYPE)(4096)
 
-/* Watchdog settings */
-#define MAX_WATCHDOG_RESETS 				3
-#define WATCHDOG_TIMEOUT_MS 				((uint32_t)2000)
+/* Watchdog tunables (timeout, boot-loop limit, stall deadline, healthy-uptime
+ * decay) live with the rest of the watchdog logic in WatchdogSupervisor.c. The
+ * task priority and period above are scheduling policy, so they stay here with
+ * the other tasks' priorities and periods. */
 
 /*******************************************************************************/
 /*                               DATA TYPES                                    */
@@ -118,7 +120,7 @@
 /*                       STATIC FUNCTION DECLARATIONS                          */
 /*******************************************************************************/
 #if (WATCHDOG_ENABLED == ON)
-static void checkResetReason(void);
+static void watchdogSupervisorTask(__unused void *taskParams);
 #endif
 /***************************** Tasks declarations ******************************/
 static void aliveTask(__unused void *taskParams);
@@ -136,53 +138,6 @@ static void blindsTask(__unused void *taskParams);
 /*******************************************************************************/
 TaskHandle_t monitorTaskHandle = NULL;
 TaskHandle_t aliveTaskHandle = NULL;
-
-/*******************************************************************************/
-/*                          STATIC FUNCTION DEFINITIONS                        */
-/*******************************************************************************/
-
-#if (WATCHDOG_ENABLED == ON)
-/* 
- * Function: checkResetReason
- * 
- * Description: Check the reset cause and handle it accordingly
- * 
- * Parameters:
- *   - none
- * 
- * Returns: void
- */
-static void checkResetReason(void) 
-{
-	/* Check if the system was reset by the watchdog */
-    if (watchdog_enable_caused_reboot()) 
-	{
-        /* If the system was reset by the watchdog, increment the counter in the scratch register.
-         * A scratch register is a small, temporary storage location built into the hardware of a microcontroller 
-         * peripheral, such as a watchdog timer, UART, or DMA controller. 
-         * 
-         * Here we use the property of the Scratch Register which is that they retain information through a 
-         * soft reset of the chip, such as watchdog reset (they still lose their contents during a power-off though (hard reset)) */
-        watchdog_hw->scratch[0] = watchdog_hw->scratch[0] + 1;
-        uint32_t count = watchdog_hw->scratch[0];
-
-        LOG("Watchdog reset detected! Count: %ld\n", count);
-        
-        if (count >= MAX_WATCHDOG_RESETS) 
-		{
-            LOG("Too many watchdog resets! Entering error state\n");
-            watchdog_disable();
-
-			CriticalErrorHandler(MODULE_ID_OS, ERROR_ID_WATCHDOG_RESETS);
-        }
-    } 
-	else 
-	{
-        /* Reset not caused by watchdog, reset the counter */
-        watchdog_hw->scratch[0] = 0;
-    }
-}
-#endif
 
 /*******************************************************************************/
 /*                          GLOBAL FUNCTION DEFINITIONS                        */
@@ -203,8 +158,8 @@ void OS_start( void )
 	BaseType_t taskCreationStatus[NUM_OF_TASKS_TO_CREATE];
 
 #if (WATCHDOG_ENABLED == ON)
-	/* Check if the system was reset by the watchdog */
-	checkResetReason();
+	/* Check the reset cause and enforce the boot-loop limit before anything else. */
+	WatchdogSupervisor_HandleBootResetCause();
 #endif
 
     /** Check if we're running FreeRTOS on single core or both RP2350 cores:
@@ -233,14 +188,18 @@ void OS_start( void )
 	taskCreationStatus[4] = xTaskCreate( blindsTask, "Blinds", STACK_2048_BYTES, NULL, BLINDS_TASK_PRIORITY, NULL);
 
 #if (WATCHDOG_ENABLED == ON)
-    /*  Enable the watchdog timer: 
-	 *  	void watchdog_enable(uint32_t delay_ms, bool pause_on_debug)
-	 *  	delay_ms: 		Number of milliseconds before watchdog will reboot without watchdog_update being called. 
-	              		Maximum of 8388, which is approximately 8.3 seconds
-     *  	pause_on_debug: If the watchdog should be paused when the debugger is stepping through code */
-	watchdog_enable(WATCHDOG_TIMEOUT_MS, true);
+	/* Create the watchdog supervisor. It owns the watchdog pet (moved out of the
+	 * lowest-priority aliveTask, where the pet sat behind a blocking CYW43 call)
+	 * and runs at high priority so a CPU-hogging task cannot starve the pet. The
+	 * supervisor captures its own handle internally, so none is needed here. */
+	if (xTaskCreate(watchdogSupervisorTask, "WdSupervisor", STACK_2048_BYTES, NULL,
+					WATCHDOG_SUPERVISOR_TASK_PRIORITY, NULL) != pdPASS)
+	{
+		CriticalErrorHandler(MODULE_ID_OS, ERROR_ID_TASK_FAILED_TO_CREATE);
+	}
 
-	LOG("Watchdog enabled with %ld ms timeout \n", WATCHDOG_TIMEOUT_MS);
+	/* Arm the hardware watchdog now that the supervisor exists to pet it. */
+	WatchdogSupervisor_Enable();
 #endif
 
 	/* Check if the tasks were created successfully */
@@ -311,56 +270,34 @@ void OS_start( void )
 	for( ;; );
 }
 
-/* 
+/*
  * Function: reset_system
- * 
- * Description: Reset the system by notifying the aliveTask to stop petting the watchdog
- * 
+ *
+ * Description: Reset the system cleanly. Delegates to the watchdog supervisor,
+ * which stops petting the watchdog so the hardware reboots us; falls back to a
+ * direct reboot when the watchdog feature is disabled.
+ *
  * Parameters:
  *   - none
- * 
+ *
  * Returns: void
  */
 void reset_system(void)
 {
 #if (WATCHDOG_ENABLED == ON)
-    /* Reset the watchdog reset counter since this is an intentional reset (it will still be incremented once but won't stack up) */
-    watchdog_hw->scratch[0] = 0;
-
-    /* Check if the watchdog is actually enabled */
-    if (watchdog_hw->ctrl & WATCHDOG_CTRL_ENABLE_BITS)
-    {
-        /* Tell the aliveTask to stop petting the watchdog in turn causing a reset */
-        xTaskNotifyGive(aliveTaskHandle);
-
-        /* Wait for the watchdog to reset the system */
-        while(1)
-        {
-            vTaskDelay(portMAX_DELAY);
-        }
-    }
-    else
-    {
-        /* Watchdog was supposed to be enabled but isn't. Trigger a direct reset. */
-        LOG("Watchdog not enabled, triggering direct reset.\n");
-        /* Parameters: pc, sp, delay_ms */
-        watchdog_reboot(0, 0, 10); /* Reboot after 10ms */
-        /* Wait for the reset */
-        while(1)
-        {
-            vTaskDelay(portMAX_DELAY);
-        }
-    }
+    /* Ask the supervisor to stop petting -> watchdog reboots the board. */
+    WatchdogSupervisor_RequestReset();
 #else
     /* Watchdog is disabled in configuration, trigger a direct reset */
     LOG("Watchdog disabled by configuration, triggering direct reset.\n");
     watchdog_reboot(0, 0, 10); /* Reboot after 10ms */
-    /* Wait for the reset */
+#endif
+
+    /* Wait for the reset to take effect */
     while(1)
     {
         vTaskDelay(portMAX_DELAY);
     }
-#endif
 }
 
 /*******************************************************************************/
@@ -534,18 +471,13 @@ static void aliveTask(__unused void *taskParams)
 #endif
 
 #if (WATCHDOG_ENABLED == ON)
-		/* TODO - add additional critical system checks that should be done before resetting the watchdog */
-
-        /* Check if a reset was requested, in which case we don't pet the watchdog */
-        if(ulTaskNotifyTake(pdTRUE, NON_BLOCKING) > 0) // Checks task's notification count before it is cleared (pdTRUE means we clear it after checking)
-        {
-            vTaskDelay(pdMS_TO_TICKS(WATCHDOG_TIMEOUT_MS + 100)); // Wait long enough to let the watchdog timeout (trigger a reset)
-        }
-        else
-        {
-            /* Pet the watchdog to keep him from barking (rebooting the system) */
-            watchdog_update();
-        }
+		/* Signal liveness to the watchdog supervisor. This sits at the very end of
+		 * the loop, AFTER the (potentially blocking) CYW43 LED section, so the
+		 * heartbeat only advances on a fully completed iteration. If aliveTask
+		 * blocks inside the loop or is starved of CPU, the heartbeat goes stale and
+		 * the supervisor catches it. The watchdog pet itself now lives in the
+		 * supervisor, decoupled from this lowest-priority task and from WiFi. */
+		WatchdogSupervisor_ReportAlive();
 #endif
 
 	}
@@ -617,4 +549,34 @@ static void blindsTask(__unused void *taskParams)
 		Blinds_MainFunction();
 	}
 }
+
+#if (WATCHDOG_ENABLED == ON)
+/*
+ * Function: watchdogSupervisorTask
+ *
+ * Description: Thin task wrapper around the WatchdogSupervisor component. Like
+ * the other tasks here it only orchestrates - it initialises the supervisor and
+ * then calls its main function once per period. All the watchdog logic (petting,
+ * stall detection, the diagnostic dump, boot-loop counter decay) lives in
+ * WatchdogSupervisor.c.
+ *
+ * Parameters:
+ *   - taskParams (not used)
+ *
+ * Returns: void (infinite loop)
+ */
+static void watchdogSupervisorTask(__unused void *taskParams)
+{
+	TickType_t xLastWakeTime;
+
+	WatchdogSupervisor_Init();
+
+	xLastWakeTime = xTaskGetTickCount();
+	for ( ;; )
+	{
+		vTaskDelayUntil(&xLastWakeTime, WATCHDOG_SUPERVISOR_PERIOD_TICKS);
+		WatchdogSupervisor_MainFunction();
+	}
+}
+#endif /* WATCHDOG_ENABLED == ON */
 
