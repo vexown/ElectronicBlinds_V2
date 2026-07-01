@@ -135,6 +135,27 @@
 #include <stdint.h>
 
 /**
+ * @brief Classification of what caused the previous boot, as decoded by
+ *        FaultHandler_ReportLastCrash() and kept in RAM for the rest of this
+ *        boot so the reset-cause logic (WatchdogSupervisor_HandleBootResetCause)
+ *        can act on it after the scratch breadcrumb has been consumed/cleared.
+ */
+typedef enum
+{
+    LAST_RESET_NONE = 0, /* No valid breadcrumb: a fresh power-on/external reset,
+                          * OR - if this boot followed a watchdog reboot - an
+                          * unexplained hardware timeout where nothing in the
+                          * system got the chance to record a cause (a strong
+                          * clue in itself: scheduler-level wedge / IRQs off /
+                          * the supervisor task starved). */
+    LAST_RESET_FAULT,    /* A recorded fault/stall (HardFault, configASSERT,
+                          * stack overflow, malloc failure or watchdog stall).
+                          * FaultHandler_GetLastCause() holds a one-line summary. */
+    LAST_RESET_CLEAN     /* An intentional reboot (reset_system/RequestReset,
+                          * e.g. after an OTA update) - expected, not a fault. */
+} FaultHandler_ResetClass;
+
+/**
  * @brief Print any crash info recorded by the previous boot and clear it.
  *
  * Inspects watchdog scratch[1..3] for a valid fault record (identified by the
@@ -225,5 +246,43 @@ __attribute__((noreturn)) void FaultHandler_RecordMallocFailed(void);
  * @param task_state  eTaskState value (cast to uint32_t) of the stalled task.
  */
 void FaultHandler_RecordWatchdogStall(const char *task_name, uint32_t task_state);
+
+/**
+ * @brief Record that the reboot about to happen is intentional (a clean reboot).
+ *
+ * Called just before a deliberate reset (reset_system() -> RequestReset(), e.g.
+ * to apply an OTA update). Because such a reboot goes through the watchdog, the
+ * next boot's watchdog_enable_caused_reboot() would otherwise be
+ * indistinguishable from a crash. This leaves a "clean" breadcrumb so
+ * FaultHandler_ReportLastCrash() classifies the next boot as LAST_RESET_CLEAN
+ * and the reset-cause logic does NOT park the board.
+ *
+ * Stores:
+ *   - scratch[1] = magic | FAULT_TYPE_CLEAN
+ *   - scratch[2] = 0
+ *   - scratch[3] = 0
+ *
+ * Does not print or reboot.
+ */
+void FaultHandler_RecordCleanReboot(void);
+
+/**
+ * @brief Classify what caused the previous boot.
+ *
+ * Valid only after FaultHandler_ReportLastCrash() has run (it decodes the
+ * scratch breadcrumb into RAM before clearing it). Returns LAST_RESET_NONE if
+ * no valid breadcrumb was present.
+ */
+FaultHandler_ResetClass FaultHandler_GetLastResetClass(void);
+
+/**
+ * @brief One-line human-readable summary of the previous boot's fault cause.
+ *
+ * Valid only after FaultHandler_ReportLastCrash() has run. Returns a non-empty
+ * string only when FaultHandler_GetLastResetClass() == LAST_RESET_FAULT (e.g.
+ * "Watchdog stall: task 'Aliv' was Blocked" or "HardFault PC=0x... LR=0x...").
+ * Otherwise returns "". The buffer is statically owned - do not free it.
+ */
+const char *FaultHandler_GetLastCause(void);
 
 #endif /* FAULT_HANDLER_H */

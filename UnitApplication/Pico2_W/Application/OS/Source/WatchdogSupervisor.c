@@ -34,10 +34,6 @@
 /*                                  MACROS                                     */
 /*******************************************************************************/
 
-/* Boot-loop limit: this many watchdog resets that never reach healthy uptime
- * trips CriticalErrorHandler instead of resetting forever. */
-#define MAX_WATCHDOG_RESETS 		3
-
 /* Hardware watchdog timeout. Maximum ~8.3 s on RP2350. */
 #define WATCHDOG_TIMEOUT_MS 		((uint32_t)2000)
 
@@ -47,13 +43,6 @@
  * reflects the stalled state and matches the original "aliveTask must check in
  * within ~2 s" liveness contract. */
 #define ALIVE_STALL_DEADLINE_MS 	((uint32_t)1500)
-
-/* Once the board has run this long without a stall, the boot-loop counter
- * (scratch[0]) is cleared so isolated transient resets spread across days of
- * uptime can never accumulate to MAX_WATCHDOG_RESETS and brick the board. The
- * 3-strike rule then only trips on a true boot loop (resets that never reach
- * healthy uptime). */
-#define HEALTHY_UPTIME_MS 			((uint32_t)60000)
 
 /*******************************************************************************/
 /*                             STATIC VARIABLES                                */
@@ -75,8 +64,6 @@ static TaskHandle_t s_supervisorTaskHandle = NULL;
 /* Per-run supervisor state (were loop locals before this became a MainFunction). */
 static uint32_t   s_lastSeenHeartbeat = 0;
 static TickType_t s_lastProgressTick  = 0;
-static TickType_t s_bootTick          = 0;
-static bool       s_decayCleared      = false;
 static bool       s_stalled           = false;
 
 /* Snapshots for the stall dump. Kept at file scope (not on the supervisor's
@@ -199,33 +186,62 @@ static void dumpSystemStateOnStall(uint32_t stalledForMs)
 
 void WatchdogSupervisor_HandleBootResetCause(void)
 {
-	/* Check if the system was reset by the watchdog */
-    if (watchdog_enable_caused_reboot())
+	/* A scratch register is a small, temporary storage location built into the
+	 * hardware of a microcontroller peripheral (here, the watchdog). scratch[0]
+	 * retains its value through a soft/watchdog reset (but is lost on power-off),
+	 * so we use it as a boot-to-boot reset counter for reporting.
+	 *
+	 * ------------------------------------------------------------------------
+	 * DIAGNOSTIC POLICY: park on the FIRST unexpected watchdog reset.
+	 * ------------------------------------------------------------------------
+	 * The watchdog is only ever supposed to reset us in two situations:
+	 *   (a) an intentional reboot (reset_system() -> RequestReset(), e.g. OTA) -
+	 *       which is tagged "clean" and is NOT a fault, or
+	 *   (b) something actually went wrong (a recorded fault/stall, or an
+	 *       unexplained hardware timeout).
+	 *
+	 * For (b) we do NOT auto-recover and we do NOT wait for repeated resets to
+	 * pile up. We trap immediately and keep printing WHAT caused it, so an
+	 * intermittent watchdog reset is caught on occurrence #1 instead of only
+	 * after a rare "perfect storm" of back-to-back resets. This makes the board
+	 * non-self-healing on purpose - it is a debugging trap. Relax it back to a
+	 * counter/threshold policy once the root cause is understood. */
+    if (!watchdog_enable_caused_reboot())
 	{
-        /* If the system was reset by the watchdog, increment the counter in the scratch register.
-         * A scratch register is a small, temporary storage location built into the hardware of a microcontroller
-         * peripheral, such as a watchdog timer, UART, or DMA controller.
-         *
-         * Here we use the property of the Scratch Register which is that they retain information through a
-         * soft reset of the chip, such as watchdog reset (they still lose their contents during a power-off though (hard reset)) */
-        watchdog_hw->scratch[0] = watchdog_hw->scratch[0] + 1;
-        uint32_t count = watchdog_hw->scratch[0];
-
-        LOG("Watchdog reset detected! Count: %ld\n", count);
-
-        if (count >= MAX_WATCHDOG_RESETS)
-		{
-            LOG("Too many watchdog resets! Entering error state\n");
-            watchdog_disable();
-
-			CriticalErrorHandler(MODULE_ID_OS, ERROR_ID_WATCHDOG_RESETS);
-        }
-    }
-	else
-	{
-        /* Reset not caused by watchdog, reset the counter */
+        /* Fresh power-on or external reset - not a watchdog event. */
         watchdog_hw->scratch[0] = 0;
+        return;
     }
+
+    /* This boot followed a watchdog reboot. FaultHandler_ReportLastCrash() has
+     * already run in main() and decoded the breadcrumb into RAM, so classify
+     * the reset from that (the scratch breadcrumb itself is now cleared). */
+    FaultHandler_ResetClass cls = FaultHandler_GetLastResetClass();
+
+    if (cls == LAST_RESET_CLEAN)
+    {
+        /* Intentional reboot (e.g. applied an OTA update). Expected - carry on. */
+        watchdog_hw->scratch[0] = 0;
+        LOG("Clean intentional reboot - resuming normally.\n");
+        return;
+    }
+
+    /* Unexpected watchdog reset -> trap. Either we have a decoded cause
+     * (LAST_RESET_FAULT) or nothing recorded it (LAST_RESET_NONE), which is
+     * itself a strong clue: a scheduler-level wedge / IRQs disabled / the
+     * supervisor task starved - nothing in the system got to write a cause. */
+    watchdog_hw->scratch[0] = watchdog_hw->scratch[0] + 1;
+
+    const char *cause = (cls == LAST_RESET_FAULT)
+        ? FaultHandler_GetLastCause()
+        : "unexplained watchdog timeout - no breadcrumb "
+          "(scheduler-level hang / IRQs off / supervisor task starved)";
+
+    LOG("Unexpected watchdog reset (#%lu) - parking to preserve cause: %s\n",
+        (unsigned long)watchdog_hw->scratch[0], cause);
+
+    watchdog_disable();
+    CriticalErrorPark(MODULE_ID_OS, ERROR_ID_WATCHDOG_RESETS, cause);
 }
 
 void WatchdogSupervisor_Enable(void)
@@ -243,10 +259,8 @@ void WatchdogSupervisor_Enable(void)
 void WatchdogSupervisor_Init(void)
 {
 	s_supervisorTaskHandle = xTaskGetCurrentTaskHandle();
-	s_bootTick             = xTaskGetTickCount();
 	s_lastSeenHeartbeat    = s_aliveHeartbeat;
-	s_lastProgressTick     = s_bootTick;
-	s_decayCleared         = false;
+	s_lastProgressTick     = xTaskGetTickCount();
 	s_stalled              = false;
 
 	/* Prime the 'previous' snapshot so the first stall window has a baseline. */
@@ -277,16 +291,6 @@ void WatchdogSupervisor_MainFunction(void)
 	{
 		s_lastSeenHeartbeat = hb;
 		s_lastProgressTick  = now;
-	}
-
-	/* Boot-loop counter decay once we have proven healthy uptime. */
-	if (!s_decayCleared &&
-		(uint32_t)pdTICKS_TO_MS(now - s_bootTick) >= HEALTHY_UPTIME_MS)
-	{
-		watchdog_hw->scratch[0] = 0;
-		s_decayCleared = true;
-		LOG("Healthy for %lu ms - watchdog reset counter cleared.\n",
-			(unsigned long)HEALTHY_UPTIME_MS);
 	}
 
 	uint32_t sinceProgressMs = (uint32_t)pdTICKS_TO_MS(now - s_lastProgressTick);
@@ -326,9 +330,14 @@ void WatchdogSupervisor_ReportAlive(void)
 
 void WatchdogSupervisor_RequestReset(void)
 {
-	/* Reset the boot-loop counter since this is an intentional reset (it will
-	 * still be incremented once on the next boot but won't stack up). */
+	/* Reset the boot-loop counter since this is an intentional reset. */
 	watchdog_hw->scratch[0] = 0;
+
+	/* Tag this reboot as clean so the next boot's HandleBootResetCause() does
+	 * NOT mistake an intentional reset (e.g. applying an OTA update) for a fault
+	 * and park the board. Written now, before we stop petting / reboot; the
+	 * supervisor will not overwrite it because it stops running once notified. */
+	FaultHandler_RecordCleanReboot();
 
 	if ((watchdog_hw->ctrl & WATCHDOG_CTRL_ENABLE_BITS) && (s_supervisorTaskHandle != NULL))
 	{

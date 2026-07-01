@@ -38,18 +38,28 @@
 /*                          GLOBAL FUNCTION DEFINITIONS                        */
 /*******************************************************************************/
 
-/* 
- * Function: CriticalErrorHandler
- * 
- * Description:  Function to trap execution and with an error code
- * 
+/*
+ * Function: CriticalErrorPark
+ *
+ * Description:  Trap execution forever with an error code and an optional
+ *               human-readable detail line, reprinting periodically so a UART
+ *               adapter connected at any later time immediately sees the cause.
+ *
+ *               NOTE on recovery: only a true power-on reset (unplug power)
+ *               clears this state. Reflashing does NOT - the watchdog scratch
+ *               registers that drive the park survive the soft/watchdog reset a
+ *               flash tool uses to reboot the chip, so the message says
+ *               "Power-cycle" only, not "reflash".
+ *
  * Parameters:
  *   - moduleId: id of the module (SWC) where the error happened
- *   - errorId: id of the specific error
- * 
- * Returns: void
+ *   - errorId:  id of the specific error
+ *   - detail:   optional extra context (e.g. the decoded reset cause); may be
+ *               NULL or "" to print none
+ *
+ * Returns: void (never returns)
  */
-void CriticalErrorHandler(uint8_t moduleId, uint8_t errorId)
+void CriticalErrorPark(uint8_t moduleId, uint8_t errorId, const char *detail)
 {
     uint32_t ticks = 0;
 
@@ -60,13 +70,35 @@ void CriticalErrorHandler(uint8_t moduleId, uint8_t errorId)
 #endif
         if ((ticks % CRIT_PARK_REPRINT_TICKS) == 0U)
         {
-            printf("\n[CRITICAL] PARKED - moduleId=%u errorId=%u - Power-cycle or reflash to recover.\n",
+            printf("\n[CRITICAL] PARKED - moduleId=%u errorId=%u - Power-cycle to recover.\n",
                   (unsigned)moduleId, (unsigned)errorId);
+            if ((detail != NULL) && (detail[0] != '\0'))
+            {
+                printf("           Cause: %s\n", detail);
+            }
         }
 
         ticks++;
         busy_wait_ms(CRIT_PARK_TICK_MS);
     }
+}
+
+/*
+ * Function: CriticalErrorHandler
+ *
+ * Description:  Trap execution with an error code (no extra detail). Thin
+ *               wrapper over CriticalErrorPark() for the many call sites that
+ *               only have a module/error to report.
+ *
+ * Parameters:
+ *   - moduleId: id of the module (SWC) where the error happened
+ *   - errorId: id of the specific error
+ *
+ * Returns: void (never returns)
+ */
+void CriticalErrorHandler(uint8_t moduleId, uint8_t errorId)
+{
+    CriticalErrorPark(moduleId, errorId, NULL);
 }
 
 /* 

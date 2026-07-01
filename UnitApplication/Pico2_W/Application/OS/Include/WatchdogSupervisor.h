@@ -3,9 +3,9 @@
  * Description: System health watchdog supervisor.
  *
  * This component owns everything to do with the hardware watchdog: the
- * boot-time reset-cause / boot-loop check, arming the timer, and the runtime
- * supervisor that actually pets it. OS_manager only orchestrates - it creates a
- * thin task that calls into here and wires up the few entry points below.
+ * boot-time reset-cause trap, arming the timer, and the runtime supervisor that
+ * actually pets it. OS_manager only orchestrates - it creates a thin task that
+ * calls into here and wires up the few entry points below.
  *
  * Design rationale (why the pet is NOT in the lowest-priority task anymore):
  *
@@ -37,14 +37,24 @@
 #include <stdint.h>
 
 /**
- * @brief Boot-time: inspect the reset cause and enforce the boot-loop limit.
+ * @brief Boot-time: inspect the reset cause and trap on any unexpected watchdog
+ *        reset (diagnostic policy).
  *
- * If this boot was caused by the watchdog, increments the persistent reset
- * counter (watchdog scratch[0]); if too many resets have happened without the
- * board ever reaching healthy uptime, disables the watchdog and traps in
- * CriticalErrorHandler. Otherwise (a clean power-on) clears the counter.
+ * If this boot was NOT caused by the watchdog (fresh power-on / external reset),
+ * clears the reset counter and returns. If it WAS caused by the watchdog:
+ *   - an intentional reboot tagged clean (reset_system/RequestReset, e.g. OTA)
+ *     is recognised via FaultHandler_GetLastResetClass() and resumes normally;
+ *   - anything else is treated as a fault and traps immediately in
+ *     CriticalErrorPark(), which reprints the decoded cause periodically.
  *
- * Must be called once, early in OS_start(), before the scheduler starts.
+ * This deliberately does NOT auto-recover and does NOT wait for repeated resets
+ * to accumulate: it catches an intermittent watchdog reset on occurrence #1 and
+ * preserves WHAT caused it. It is a debugging trap - relax it back to a
+ * counter/threshold policy once the root cause is understood.
+ *
+ * Requires FaultHandler_ReportLastCrash() to have already run this boot (it
+ * decodes the scratch breadcrumb into RAM). Must be called once, early in
+ * OS_start(), before the scheduler starts.
  */
 void WatchdogSupervisor_HandleBootResetCause(void);
 
@@ -66,9 +76,9 @@ void WatchdogSupervisor_Init(void);
 /**
  * @brief One supervisor cycle. Call every supervisor period from the task loop.
  *
- * Honors an intentional reset request, tracks the heartbeat, decays the
- * boot-loop counter after healthy uptime, and either pets the watchdog or - on
- * a detected stall - records a breadcrumb, prints a live dump and stops petting.
+ * Honors an intentional reset request, tracks the monitored task's heartbeat,
+ * and either pets the watchdog or - on a detected stall - records a breadcrumb,
+ * prints a live dump and stops petting so the hardware watchdog resets us.
  */
 void WatchdogSupervisor_MainFunction(void);
 
@@ -81,9 +91,10 @@ void WatchdogSupervisor_ReportAlive(void);
 /**
  * @brief Request an intentional, clean reset of the board.
  *
- * Clears the boot-loop counter (this reset is deliberate, not a fault) and
- * stops the watchdog being pet so the hardware reboots the board. Falls back to
- * a direct watchdog_reboot() if the watchdog is somehow not actually running.
+ * Tags the reboot as clean (via FaultHandler_RecordCleanReboot()) so the next
+ * boot does not mistake this deliberate reset for a fault and park, then stops
+ * the watchdog being pet so the hardware reboots the board. Falls back to a
+ * direct watchdog_reboot() if the watchdog is somehow not actually running.
  * The caller is expected to then block until the reset occurs.
  */
 void WatchdogSupervisor_RequestReset(void);

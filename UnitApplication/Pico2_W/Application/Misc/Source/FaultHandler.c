@@ -40,6 +40,7 @@
 #define FAULT_TYPE_STACK_OVF    0x003U
 #define FAULT_TYPE_MALLOC_FAIL  0x004U
 #define FAULT_TYPE_WD_STALL     0x005U
+#define FAULT_TYPE_CLEAN        0x006U  /* intentional reboot marker (not a fault) */
 
 /* Standard Cortex-M System Control Block registers. Accessed directly to
  * avoid pulling CMSIS into the rest of the codebase. 
@@ -66,6 +67,17 @@
  * may not be running yet when a fault fires), so reading it from a fault
  * context is safe. Declared here to avoid pulling TCB_t into this file. */
 extern TaskHandle_t volatile pxCurrentTCB;
+
+/*******************************************************************************/
+/*                             STATIC VARIABLES                                */
+/*******************************************************************************/
+
+/* Decoded summary of the previous boot's reset, populated by
+ * FaultHandler_ReportLastCrash() before it clears the scratch breadcrumb. These
+ * live in RAM (not scratch) so WatchdogSupervisor_HandleBootResetCause() can
+ * still act on the cause later in the same boot, after scratch has been wiped. */
+static FaultHandler_ResetClass s_lastResetClass = LAST_RESET_NONE;
+static char                    s_lastCause[96]  = {0};
 
 /*******************************************************************************/
 /*                       STATIC FUNCTION DECLARATIONS                          */
@@ -520,9 +532,30 @@ void FaultHandler_ReportLastCrash(void)
     const uint32_t data1 = watchdog_hw->scratch[2];
     const uint32_t data2 = watchdog_hw->scratch[3];
 
+    /* Default classification; overwritten below once a valid record is decoded. */
+    s_lastResetClass = LAST_RESET_NONE;
+    s_lastCause[0]   = '\0';
+
     if ((tag & FAULT_MAGIC_MASK) != FAULT_MAGIC_BASE) return;
 
     const uint32_t type = tag & FAULT_TYPE_MASK;
+
+    /* An intentional reboot marker is not a crash: note it quietly, classify it
+     * as CLEAN (so the reset-cause logic won't park), then clear and return. */
+    if (type == FAULT_TYPE_CLEAN)
+    {
+        s_lastResetClass = LAST_RESET_CLEAN;
+        printf("\nPrevious boot: clean reboot (intentional)\n\n");
+        watchdog_hw->scratch[1] = 0;
+        watchdog_hw->scratch[2] = 0;
+        watchdog_hw->scratch[3] = 0;
+        return;
+    }
+
+    /* From here on it is a genuine fault/stall. Build a one-line summary into
+     * s_lastCause (for the park message) alongside the detailed live report. */
+    s_lastResetClass = LAST_RESET_FAULT;
+
     printf("\n---- Previous boot crashed ----\n");
     switch (type)
     {
@@ -532,14 +565,20 @@ void FaultHandler_ReportLastCrash(void)
                    (unsigned long)data1, (unsigned long)data2);
             printf("Resolve PC with: arm-none-eabi-addr2line -e <elf> 0x%08lx\n",
                    (unsigned long)data1);
+            snprintf(s_lastCause, sizeof(s_lastCause),
+                     "HardFault PC=0x%08lx LR=0x%08lx",
+                     (unsigned long)data1, (unsigned long)data2);
             break;
 
         case FAULT_TYPE_ASSERT:
             printf("Type: configASSERT\n");
             printf("Line %lu (file hash 0x%08lx)\n",
                    (unsigned long)data1, (unsigned long)data2);
+            snprintf(s_lastCause, sizeof(s_lastCause),
+                     "configASSERT line %lu (file hash 0x%08lx)",
+                     (unsigned long)data1, (unsigned long)data2);
             break;
-            
+
         case FAULT_TYPE_STACK_OVF:
         {
             /* data1 holds the source discriminator (FreeRTOS pattern check vs
@@ -550,20 +589,19 @@ void FaultHandler_ReportLastCrash(void)
             {
                 name[i] = (char)((data2 >> (i * 8)) & 0xFFU);
             }
-            if (data1 == STK_OVF_SOURCE_STKOF)
-            {
-                printf("Type: Stack overflow (hardware STKOF)\n");
-            }
-            else
-            {
-                printf("Type: Stack overflow\n");
-            }
+            const char *src = (data1 == STK_OVF_SOURCE_STKOF)
+                ? " (hardware STKOF)" : "";
+            printf("Type: Stack overflow%s\n", src);
             printf("Task name starts with: '%s'\n", name);
+            snprintf(s_lastCause, sizeof(s_lastCause),
+                     "Stack overflow%s in task '%s'", src, name);
             break;
         }
 
         case FAULT_TYPE_MALLOC_FAIL:
             printf("Type: pvPortMalloc failed (out of FreeRTOS heap)\n");
+            snprintf(s_lastCause, sizeof(s_lastCause),
+                     "Heap exhausted (pvPortMalloc failed)");
             break;
 
         case FAULT_TYPE_WD_STALL:
@@ -580,24 +618,46 @@ void FaultHandler_ReportLastCrash(void)
             {
                 name[i] = (char)((data2 >> (i * 8)) & 0xFFU);
             }
+            const char *state = (data1 < (sizeof(stateNames) / sizeof(stateNames[0])))
+                       ? stateNames[data1] : "?";
             printf("Type: Watchdog stall (task heartbeat stopped)\n");
             printf("Stalled task starts with: '%s'\n", name);
-            printf("Task state at stall: %s\n",
-                   (data1 < (sizeof(stateNames) / sizeof(stateNames[0])))
-                       ? stateNames[data1] : "?");
+            printf("Task state at stall: %s\n", state);
+            snprintf(s_lastCause, sizeof(s_lastCause),
+                     "Watchdog stall: task '%s' was %s", name, state);
             break;
         }
 
         default:
             printf("Type: unknown (0x%lx)\n", (unsigned long)type);
+            snprintf(s_lastCause, sizeof(s_lastCause),
+                     "Unknown fault type 0x%lx", (unsigned long)type);
             break;
     }
     printf("-------------------------------\n\n");
 
-    /* Clear so we don't re-report on subsequent reboots. */
+    /* Clear so we don't re-report on subsequent reboots. The decoded summary
+     * survives in s_lastResetClass / s_lastCause for the rest of this boot. */
     watchdog_hw->scratch[1] = 0;
     watchdog_hw->scratch[2] = 0;
     watchdog_hw->scratch[3] = 0;
+}
+
+void FaultHandler_RecordCleanReboot(void)
+{
+    watchdog_hw->scratch[1] = FAULT_TAG(FAULT_TYPE_CLEAN);
+    watchdog_hw->scratch[2] = 0;
+    watchdog_hw->scratch[3] = 0;
+}
+
+FaultHandler_ResetClass FaultHandler_GetLastResetClass(void)
+{
+    return s_lastResetClass;
+}
+
+const char *FaultHandler_GetLastCause(void)
+{
+    return s_lastCause;
 }
 
 __attribute__((noreturn)) void FaultHandler_RecordAssert(const char *file, uint32_t line)
