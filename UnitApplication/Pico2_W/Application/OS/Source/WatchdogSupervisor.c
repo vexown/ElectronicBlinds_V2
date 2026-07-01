@@ -15,12 +15,15 @@
 /* Kernel includes. */
 #include "FreeRTOS.h"
 #include "task.h"
+#include "semphr.h"              /* xSemaphoreGetMutexHolder (DEBUG: CYW43 lock holder) */
 
 /* SDK includes */
 #include "pico/stdlib.h"
 #include "hardware/watchdog.h"
 #include "hardware/regs/watchdog.h"
 #include "hardware/structs/watchdog.h"
+#include "pico/cyw43_arch.h"           /* DEBUG: cyw43_arch_async_context() */
+#include "pico/async_context_freertos.h" /* DEBUG: async_context_freertos_t.lock_mutex */
 
 /* OS includes */
 #include "OS_manager.h"          /* MAX_NUM_OF_TASKS */
@@ -81,10 +84,44 @@ static configRUN_TIME_COUNTER_TYPE prevTotalRunTime = 0;
 /*******************************************************************************/
 
 static void dumpSystemStateOnStall(uint32_t stalledForMs);
+static const char *cyw43LockHolderName(void);
 
 /*******************************************************************************/
 /*                          STATIC FUNCTION DEFINITIONS                        */
 /*******************************************************************************/
+
+/*
+ * Function: cyw43LockHolderName
+ *
+ * Description: DEBUG helper. Names the task currently holding the CYW43
+ * async_context lock - the alive canary's only indefinite block is acquiring
+ * this lock (async_context_acquire_lock_blocking in aliveTask), so when the
+ * canary is found Blocked, whoever holds this lock is the prime suspect.
+ *
+ * cyw43_arch_async_context() returns the async_context_t base, which is the
+ * first member of the async_context_freertos_t actually in use (the project
+ * builds with pico_cyw43_arch_lwip_sys_freertos), so we can recover the
+ * SemaphoreHandle_t lock_mutex and ask FreeRTOS who owns it.
+ *
+ * Returns: task name of the holder, or "(unheld)"/"(n/a)" - never NULL.
+ */
+static const char *cyw43LockHolderName(void)
+{
+	async_context_t *ctx = cyw43_arch_async_context();
+	if (ctx == NULL)
+	{
+		return "(n/a)";
+	}
+
+	SemaphoreHandle_t lock = ((async_context_freertos_t *)ctx)->lock_mutex;
+	if (lock == NULL)
+	{
+		return "(n/a)";
+	}
+
+	TaskHandle_t holder = xSemaphoreGetMutexHolder(lock);
+	return (holder != NULL) ? pcTaskGetName(holder) : "(unheld)";
+}
 
 /*
  * Function: dumpSystemStateOnStall
@@ -175,6 +212,9 @@ static void dumpSystemStateOnStall(uint32_t stalledForMs)
 
 	printf("Legend: St= R running / r ready / B blocked / S suspended | "
 		   "StkFree=free stack words | Win%%=CPU share over the last supervisor cycle\n");
+	/* DEBUG: the canary's only indefinite block is the CYW43 lock, so if it is
+	 * shown Blocked above, this names the task hogging that lock - the suspect. */
+	printf("CYW43 async_context lock currently held by: %s\n", cyw43LockHolderName());
 	printf("No longer petting the watchdog -> board resets within ~%lu ms.\n",
 		   (unsigned long)WATCHDOG_TIMEOUT_MS);
 	printf("=========================================================\n");
@@ -298,13 +338,18 @@ void WatchdogSupervisor_MainFunction(void)
 	if (sinceProgressMs >= ALIVE_STALL_DEADLINE_MS)
 	{
 		/* Stall: leave a cross-reset breadcrumb (so the cause is announced on the
-		 * next boot too), print a full live dump, then stop petting. */
-		eTaskState  st   = (s_monitoredTaskHandle != NULL)
+		 * next boot too), print a full live dump, then stop petting.
+		 *
+		 * The breadcrumb carries the monitored task's state plus the CYW43 lock
+		 * holder: for the common Blocked case that names the culprit in the park
+		 * line without needing the live dump to have been captured. The monitored
+		 * task is always the alive canary, so we do not spend a scratch slot on
+		 * its (known) name. */
+		eTaskState  st     = (s_monitoredTaskHandle != NULL)
 			? eTaskGetState(s_monitoredTaskHandle) : eInvalid;
-		const char *name = (s_monitoredTaskHandle != NULL)
-			? pcTaskGetName(s_monitoredTaskHandle) : "?";
+		const char *holder = cyw43LockHolderName();
 
-		FaultHandler_RecordWatchdogStall(name, (uint32_t)st);
+		FaultHandler_RecordWatchdogStall((uint32_t)st, holder);
 		dumpSystemStateOnStall(sinceProgressMs);
 		s_stalled = true;
 	}

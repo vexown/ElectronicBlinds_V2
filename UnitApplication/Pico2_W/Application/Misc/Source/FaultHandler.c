@@ -606,25 +606,37 @@ void FaultHandler_ReportLastCrash(void)
 
         case FAULT_TYPE_WD_STALL:
         {
-            /* data1 = eTaskState of the stalled task at detection time;
-             * data2 = first 4 chars of its name packed as little-endian ASCII.
-             * The state is the key discriminator: a BLOCKED task was stuck
-             * waiting on a resource (e.g. the CYW43 lock); a READY task was
-             * being starved of CPU by a higher-priority hog. */
+            /* data1 = eTaskState of the stalled (alive canary) task at detection;
+             * data2 = first 4 chars of the CYW43 lock holder's name, packed as
+             * little-endian ASCII. The state is the key discriminator: a BLOCKED
+             * canary was stuck waiting on a resource - and its only indefinite
+             * block is the CYW43 lock, so the holder named below is the suspect.
+             * A READY canary was instead starved of CPU by a higher-priority hog
+             * (in which case the holder is not relevant - see the live dump). */
             static const char *const stateNames[] =
                 { "Running", "Ready", "Blocked", "Suspended", "Deleted", "Invalid" };
-            char name[5] = {0};
+            char holder[5] = {0};
             for (int i = 0; i < 4; i++)
             {
-                name[i] = (char)((data2 >> (i * 8)) & 0xFFU);
+                holder[i] = (char)((data2 >> (i * 8)) & 0xFFU);
             }
             const char *state = (data1 < (sizeof(stateNames) / sizeof(stateNames[0])))
                        ? stateNames[data1] : "?";
-            printf("Type: Watchdog stall (task heartbeat stopped)\n");
-            printf("Stalled task starts with: '%s'\n", name);
-            printf("Task state at stall: %s\n", state);
-            snprintf(s_lastCause, sizeof(s_lastCause),
-                     "Watchdog stall: task '%s' was %s", name, state);
+            printf("Type: Watchdog stall (monitored task heartbeat stopped)\n");
+            printf("Monitored task state at stall: %s\n", state);
+            printf("CYW43 lock holder at stall: '%s'\n", holder);
+            if (data1 == (uint32_t)eBlocked)
+            {
+                snprintf(s_lastCause, sizeof(s_lastCause),
+                         "Watchdog stall: canary Blocked on CYW43 lock held by '%s'",
+                         holder);
+            }
+            else
+            {
+                snprintf(s_lastCause, sizeof(s_lastCause),
+                         "Watchdog stall: canary was %s (CYW43 lock holder '%s')",
+                         state, holder);
+            }
             break;
         }
 
@@ -695,17 +707,19 @@ __attribute__((noreturn)) void FaultHandler_RecordMallocFailed(void)
     reboot_now();
 }
 
-void FaultHandler_RecordWatchdogStall(const char *task_name, uint32_t task_state)
+void FaultHandler_RecordWatchdogStall(uint32_t task_state, const char *lock_holder)
 {
     /* Unlike the other recorders this one does NOT reboot. The watchdog
      * supervisor calls it after it has already printed a full live diagnostic
      * dump, and then deliberately stops petting the watchdog so the hardware
      * performs the reset. We only leave the compact breadcrumb in scratch[1..3]
      * so that FaultHandler_ReportLastCrash() can announce the cause on the next
-     * boot too - useful if nobody was watching the UART when the stall hit. */
+     * boot too - useful if nobody was watching the UART when the stall hit.
+     * scratch[3] carries the CYW43 lock holder (the suspect), not the (always
+     * "alive canary") stalled task name. */
     watchdog_hw->scratch[1] = FAULT_TAG(FAULT_TYPE_WD_STALL);
     watchdog_hw->scratch[2] = task_state;
-    watchdog_hw->scratch[3] = pack_first4(task_name);
+    watchdog_hw->scratch[3] = pack_first4(lock_holder);
 }
 
 /**
