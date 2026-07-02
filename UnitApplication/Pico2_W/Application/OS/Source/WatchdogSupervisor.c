@@ -41,11 +41,18 @@
 #define WATCHDOG_TIMEOUT_MS 		((uint32_t)2000)
 
 /* How long the monitored task's heartbeat may stop advancing before the
- * supervisor declares a stall, dumps diagnostics and forces a reset. Kept just
- * under WATCHDOG_TIMEOUT_MS (and ~3 missed 500 ms aliveTask periods) so the dump
- * reflects the stalled state and matches the original "aliveTask must check in
- * within ~2 s" liveness contract. */
-#define ALIVE_STALL_DEADLINE_MS 	((uint32_t)1500)
+ * supervisor declares a stall, dumps diagnostics and forces a reset.
+ *
+ * Must exceed the worst LEGAL duration of one aliveTask loop iteration, not the
+ * typical one. The LED lives on the CYW43 wifi chip, so a blink is an SPI ioctl
+ * with a 1 s response timeout baked into pico-sdk (CYW43_IOCTL_TIMEOUT_US),
+ * preceded by a power-save wake handshake (~130 ms worst case). One iteration
+ * can therefore legally take ~500 ms period + ~1.15 s blink = ~1.65 s before
+ * cyw43_gpio_set returns an error and aliveTask's own consecutive-failure
+ * handling engages. 4 s gives that path ~2x margin while still catching real
+ * scheduler-level hangs quickly (a 1.5 s deadline was tripped by a single slow
+ * wifi-chip ioctl on 2026-07). */
+#define ALIVE_STALL_DEADLINE_MS 	((uint32_t)4000)
 
 /*******************************************************************************/
 /*                             STATIC VARIABLES                                */

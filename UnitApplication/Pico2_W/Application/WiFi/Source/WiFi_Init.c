@@ -71,6 +71,17 @@ bool connectToWifi(void)
     {
         LOG("connected sucessfully\n");
         status = true;
+
+        /* Disable wifi power-save. The default CYW43_PERFORMANCE_PM lets the
+           chip doze between beacons, so every CYW43 access (including the alive
+           LED, which lives on the chip's WL_GPIO0) starts with a wake handshake
+           and occasionally stalls for up to the driver's 1 s ioctl timeout.
+           This device is mains-powered - keep the chip awake. */
+        if (cyw43_wifi_pm(&cyw43_state, CYW43_NONE_PM) != 0)
+        {
+            LOG("failed to disable wifi power-save\n");
+        }
+
 #if (USE_STATIC_IP == ON)
         configStaticIP();
 #endif
