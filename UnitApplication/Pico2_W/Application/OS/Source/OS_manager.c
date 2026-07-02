@@ -442,14 +442,67 @@ static void aliveTask(__unused void *taskParams)
 			In FreeRTOS where we use the pico_cyw43_arch_lwip_sys_freertos library, a dedicated task is used to process these events */
 		async_context_t *context = cyw43_arch_async_context();
 
+		/* DEBUG: time the two halves of the "blink" - waiting for the CYW43 lock
+		 * and the cyw43_gpio_set ioctl itself. Remove together with the DEBUG
+		 * watchdog-trap commits. */
+		uint64_t dbgT0Us = time_us_64();
+
 		/* Acquire the lock */
 		async_context_acquire_lock_blocking(context);
-		
+
+		uint64_t dbgT1Us = time_us_64(); /* DEBUG */
+
 		/* Set the state of the LED */
 		int ret = cyw43_gpio_set(&cyw43_state, CYW43_WL_GPIO_LED_PIN, state_LED);
-		
+
 		/* Release the lock */
 		async_context_release_lock(context);
+
+		/* DEBUG: blink timing stats. Immediate warning for any suspiciously slow
+		 * blink, plus a min/avg/max summary once a minute. */
+		{
+			uint64_t dbgT2Us = time_us_64();
+			uint32_t dbgLockUs = (uint32_t)(dbgT1Us - dbgT0Us);
+			uint32_t dbgGpioUs = (uint32_t)(dbgT2Us - dbgT1Us);
+
+			static uint32_t dbgCount = 0;
+			static uint32_t dbgLockMaxUs = 0;
+			static uint32_t dbgGpioMinUs = UINT32_MAX;
+			static uint32_t dbgGpioMaxUs = 0;
+			static uint64_t dbgGpioSumUs = 0;
+			static uint32_t dbgBootMaxTotalUs = 0;
+
+			if (dbgLockUs > dbgLockMaxUs) { dbgLockMaxUs = dbgLockUs; }
+			if (dbgGpioUs < dbgGpioMinUs) { dbgGpioMinUs = dbgGpioUs; }
+			if (dbgGpioUs > dbgGpioMaxUs) { dbgGpioMaxUs = dbgGpioUs; }
+			dbgGpioSumUs += dbgGpioUs;
+			dbgCount++;
+
+			uint32_t dbgTotalUs = dbgLockUs + dbgGpioUs;
+			if (dbgTotalUs > dbgBootMaxTotalUs) { dbgBootMaxTotalUs = dbgTotalUs; }
+
+			if (dbgTotalUs > 50000U) /* > 50 ms: log it the moment it happens */
+			{
+				LOG("[DEBUG] SLOW BLINK: lock wait %lu us, gpio_set %lu us\n",
+					(unsigned long)dbgLockUs, (unsigned long)dbgGpioUs);
+			}
+
+			if (dbgCount >= 120U) /* ~1 min at the 500 ms period */
+			{
+				LOG("[DEBUG] blink timing (last %lu): gpio_set min/avg/max = %lu/%lu/%lu us, lock wait max = %lu us, worst blink since boot = %lu us\n",
+					(unsigned long)dbgCount,
+					(unsigned long)dbgGpioMinUs,
+					(unsigned long)(dbgGpioSumUs / dbgCount),
+					(unsigned long)dbgGpioMaxUs,
+					(unsigned long)dbgLockMaxUs,
+					(unsigned long)dbgBootMaxTotalUs);
+				dbgCount = 0;
+				dbgLockMaxUs = 0;
+				dbgGpioMinUs = UINT32_MAX;
+				dbgGpioMaxUs = 0;
+				dbgGpioSumUs = 0;
+			}
+		}
 
 		/* Check if the LED was set successfully */
 		if(ret != 0)
