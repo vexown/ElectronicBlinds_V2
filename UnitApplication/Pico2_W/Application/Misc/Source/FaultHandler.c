@@ -10,6 +10,7 @@
 #include "FaultHandler.h"
 
 #include <stdio.h>
+#include <stdarg.h>
 
 #include "pico/stdlib.h"
 #include "hardware/uart.h"
@@ -78,6 +79,23 @@ extern TaskHandle_t volatile pxCurrentTCB;
  * still act on the cause later in the same boot, after scratch has been wiped. */
 static FaultHandler_ResetClass s_lastResetClass = LAST_RESET_NONE;
 static char                    s_lastCause[96]  = {0};
+
+/* DEBUG: persistent stall dump (see FaultHandler.h). Lives in
+ * .uninitialized_data: crt0 neither loads nor zeroes it, and SRAM survives a
+ * watchdog reset, so the dump written moments before the reset is still here
+ * on the next boot. Magic + checksum guard against a clobbered/decayed region
+ * (bootloader RAM usage, true power cycle). */
+#define STALL_DUMP_MAGIC 0x5D0D57A1U
+
+typedef struct
+{
+    uint32_t magic; /* STALL_DUMP_MAGIC when a sealed dump is present */
+    uint32_t len;   /* bytes of text[] actually used */
+    uint32_t crc;   /* FNV-1a over text[0..len) */
+    char     text[3072];
+} StallDumpBuffer;
+
+static StallDumpBuffer __uninitialized_ram(s_stallDump);
 
 /*******************************************************************************/
 /*                       STATIC FUNCTION DECLARATIONS                          */
@@ -720,6 +738,78 @@ void FaultHandler_RecordWatchdogStall(uint32_t task_state, const char *lock_hold
     watchdog_hw->scratch[1] = FAULT_TAG(FAULT_TYPE_WD_STALL);
     watchdog_hw->scratch[2] = task_state;
     watchdog_hw->scratch[3] = pack_first4(lock_holder);
+}
+
+/* DEBUG: persistent stall dump - see the block comment in FaultHandler.h. */
+
+/**
+ * @brief FNV-1a over an explicit byte range (the string variant fnv1a32()
+ *        stops at NUL; the dump length is tracked separately).
+ */
+static uint32_t fnv1a32_buf(const char *buf, uint32_t len)
+{
+    uint32_t hash = 0x811C9DC5U;
+    for (uint32_t i = 0; i < len; i++)
+    {
+        hash ^= (uint8_t)buf[i];
+        hash *= 0x01000193U;
+    }
+    return hash;
+}
+
+void FaultHandler_StallDumpBegin(void)
+{
+    s_stallDump.magic = 0; /* invalidate while the new dump is being written */
+    s_stallDump.len   = 0;
+    s_stallDump.crc   = 0;
+}
+
+void FaultHandler_StallDumpPrintf(const char *fmt, ...)
+{
+    va_list args;
+    va_list argsCopy;
+    va_start(args, fmt);
+    va_copy(argsCopy, args);
+
+    vprintf(fmt, args);
+    va_end(args);
+
+    if (s_stallDump.len < (uint32_t)sizeof(s_stallDump.text) - 1U)
+    {
+        uint32_t space = (uint32_t)sizeof(s_stallDump.text) - s_stallDump.len;
+        int written = vsnprintf(&s_stallDump.text[s_stallDump.len], (size_t)space, fmt, argsCopy);
+        if (written > 0)
+        {
+            uint32_t addedLen = (uint32_t)written;
+            /* vsnprintf reports what it WOULD have written; clamp on truncation */
+            s_stallDump.len += (addedLen < space) ? addedLen : (space - 1U);
+        }
+    }
+    va_end(argsCopy);
+}
+
+void FaultHandler_StallDumpCommit(void)
+{
+    s_stallDump.crc   = fnv1a32_buf(s_stallDump.text, s_stallDump.len);
+    s_stallDump.magic = STALL_DUMP_MAGIC;
+}
+
+const char *FaultHandler_GetSavedStallDump(void)
+{
+    if (s_stallDump.magic != STALL_DUMP_MAGIC)
+    {
+        return NULL;
+    }
+    if ((s_stallDump.len == 0U) || (s_stallDump.len >= (uint32_t)sizeof(s_stallDump.text)))
+    {
+        return NULL;
+    }
+    if (fnv1a32_buf(s_stallDump.text, s_stallDump.len) != s_stallDump.crc)
+    {
+        return NULL;
+    }
+    s_stallDump.text[s_stallDump.len] = '\0';
+    return s_stallDump.text;
 }
 
 /**

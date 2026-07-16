@@ -39,7 +39,7 @@
 /*******************************************************************************/
 
 /*
- * Function: CriticalErrorPark
+ * Function: CriticalErrorParkEx
  *
  * Description:  Trap execution forever with an error code and an optional
  *               human-readable detail line, reprinting periodically so a UART
@@ -56,10 +56,13 @@
  *   - errorId:  id of the specific error
  *   - detail:   optional extra context (e.g. the decoded reset cause); may be
  *               NULL or "" to print none
+ *   - extraInfoFn: optional callback invoked after each reprint to emit larger
+ *               diagnostics (e.g. a saved stall dump); may be NULL
  *
  * Returns: void (never returns)
  */
-void CriticalErrorPark(uint8_t moduleId, uint8_t errorId, const char *detail)
+void CriticalErrorParkEx(uint8_t moduleId, uint8_t errorId, const char *detail,
+                         void (*extraInfoFn)(void))
 {
     uint32_t ticks = 0;
 
@@ -76,11 +79,27 @@ void CriticalErrorPark(uint8_t moduleId, uint8_t errorId, const char *detail)
             {
                 printf("           Cause: %s\n", detail);
             }
+            if (extraInfoFn != NULL)
+            {
+                extraInfoFn();
+            }
         }
 
         ticks++;
         busy_wait_ms(CRIT_PARK_TICK_MS);
     }
+}
+
+/*
+ * Function: CriticalErrorPark
+ *
+ * Description: CriticalErrorParkEx() without the extra-diagnostics callback.
+ *
+ * Returns: void (never returns)
+ */
+void CriticalErrorPark(uint8_t moduleId, uint8_t errorId, const char *detail)
+{
+    CriticalErrorParkEx(moduleId, errorId, detail, NULL);
 }
 
 /*

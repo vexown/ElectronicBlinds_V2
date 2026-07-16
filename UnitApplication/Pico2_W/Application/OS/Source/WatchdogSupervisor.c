@@ -91,6 +91,7 @@ static configRUN_TIME_COUNTER_TYPE prevTotalRunTime = 0;
 /*******************************************************************************/
 
 static void dumpSystemStateOnStall(uint32_t stalledForMs);
+static void printSavedStallDump(void);
 static const char *cyw43LockHolderName(void);
 
 /*******************************************************************************/
@@ -171,14 +172,20 @@ static void dumpSystemStateOnStall(uint32_t stalledForMs)
 		totalWindow = 1; /* guard against divide-by-zero on the very first window */
 	}
 
-	printf("\n========== WATCHDOG SUPERVISOR: STALL DETECTED ==========\n");
-	printf("Monitored task heartbeat stalled for ~%lu ms (deadline %lu ms)\n",
+	/* DEBUG: every line below is teed into a reset-surviving RAM buffer so the
+	 * boot-time park can replay this dump to a terminal attached AFTER the fact. */
+	FaultHandler_StallDumpBegin();
+
+	FaultHandler_StallDumpPrintf("\n========== WATCHDOG SUPERVISOR: STALL DETECTED ==========\n");
+	FaultHandler_StallDumpPrintf("Uptime: %lu ms\n",
+		   (unsigned long)(xTaskGetTickCount() * portTICK_PERIOD_MS));
+	FaultHandler_StallDumpPrintf("Monitored task heartbeat stalled for ~%lu ms (deadline %lu ms)\n",
 		   (unsigned long)stalledForMs, (unsigned long)ALIVE_STALL_DEADLINE_MS);
-	printf("Heap: free=%u  min-ever-free=%u  largest-block=%u (bytes)\n",
+	FaultHandler_StallDumpPrintf("Heap: free=%u  min-ever-free=%u  largest-block=%u (bytes)\n",
 		   (unsigned)heap.xAvailableHeapSpaceInBytes,
 		   (unsigned)heap.xMinimumEverFreeBytesRemaining,
 		   (unsigned)heap.xSizeOfLargestFreeBlockInBytes);
-	printf("Name             St Pri StkFree  LifeMs     WinUs  Win%%\n");
+	FaultHandler_StallDumpPrintf("Name             St Pri StkFree  LifeMs     WinUs  Win%%\n");
 
 	for (UBaseType_t i = 0; i < countNow; i++)
 	{
@@ -207,7 +214,7 @@ static void dumpSystemStateOnStall(uint32_t stalledForMs)
 		configRUN_TIME_COUNTER_TYPE winUs = snapNow[i].ulRunTimeCounter - prevRun;
 		unsigned long winPct = (unsigned long)(((uint64_t)winUs * 100U) / totalWindow);
 
-		printf("%-16s %c  %2lu  %6lu  %8lu  %8lu  %3lu\n",
+		FaultHandler_StallDumpPrintf("%-16s %c  %2lu  %6lu  %8lu  %8lu  %3lu\n",
 			   snapNow[i].pcTaskName,
 			   st,
 			   (unsigned long)snapNow[i].uxCurrentPriority,
@@ -217,14 +224,46 @@ static void dumpSystemStateOnStall(uint32_t stalledForMs)
 			   winPct);
 	}
 
-	printf("Legend: St= R running / r ready / B blocked / S suspended | "
+	FaultHandler_StallDumpPrintf("Legend: St= R running / r ready / B blocked / S suspended | "
 		   "StkFree=free stack words | Win%%=CPU share over the last supervisor cycle\n");
 	/* DEBUG: the canary's only indefinite block is the CYW43 lock, so if it is
 	 * shown Blocked above, this names the task hogging that lock - the suspect. */
-	printf("CYW43 async_context lock currently held by: %s\n", cyw43LockHolderName());
-	printf("No longer petting the watchdog -> board resets within ~%lu ms.\n",
+	FaultHandler_StallDumpPrintf("CYW43 async_context lock currently held by: %s\n", cyw43LockHolderName());
+	FaultHandler_StallDumpPrintf("No longer petting the watchdog -> board resets within ~%lu ms.\n",
 		   (unsigned long)WATCHDOG_TIMEOUT_MS);
-	printf("=========================================================\n");
+	FaultHandler_StallDumpPrintf("=========================================================\n");
+
+	/* Seal the RAM copy so the next boot recognises it as valid. */
+	FaultHandler_StallDumpCommit();
+}
+
+/*
+ * Function: printSavedStallDump
+ *
+ * Description: Park-loop callback (see CriticalErrorParkEx()): replays the
+ * stall dump the PREVIOUS boot saved to reset-surviving RAM moments before the
+ * watchdog fired, so the full task table from the moment of failure reaches a
+ * terminal attached at any later time - the scratch-register breadcrumb alone
+ * cannot name a CPU hog.
+ *
+ * Parameters: none
+ *
+ * Returns: void
+ */
+static void printSavedStallDump(void)
+{
+	const char *dump = FaultHandler_GetSavedStallDump();
+	if (dump != NULL)
+	{
+		printf("---- System state captured at the moment of the stall (previous boot): ----\n");
+		printf("%s", dump);
+		printf("---------------------------------------------------------------------------\n");
+	}
+	else
+	{
+		printf("           (no stall dump survived in RAM - power was cycled, RAM was\n"
+			   "            clobbered, or the stall was never seen by the supervisor)\n");
+	}
 }
 
 /*******************************************************************************/
@@ -288,7 +327,7 @@ void WatchdogSupervisor_HandleBootResetCause(void)
         (unsigned long)watchdog_hw->scratch[0], cause);
 
     watchdog_disable();
-    CriticalErrorPark(MODULE_ID_OS, ERROR_ID_WATCHDOG_RESETS, cause);
+    CriticalErrorParkEx(MODULE_ID_OS, ERROR_ID_WATCHDOG_RESETS, cause, printSavedStallDump);
 }
 
 void WatchdogSupervisor_Enable(void)

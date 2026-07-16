@@ -290,4 +290,53 @@ FaultHandler_ResetClass FaultHandler_GetLastResetClass(void);
  */
 const char *FaultHandler_GetLastCause(void);
 
+/*
+ * ----------------------------------------------------------------------------
+ * Persistent stall dump (DEBUG diagnostic aid)
+ * ----------------------------------------------------------------------------
+ * The scratch registers hold 3 words - enough for a breadcrumb, not for the
+ * full task-table dump the watchdog supervisor prints at the moment of a stall.
+ * That dump (per-task state/priority/stack/CPU-share over the stall window) is
+ * the thing that actually names a CPU hog, and it is useless on UART if nobody
+ * is attached when the stall happens.
+ *
+ * These functions mirror the dump into a checksummed buffer placed in
+ * .uninitialized_data: crt0 neither loads nor zeroes that section, and SRAM
+ * contents survive a watchdog/soft reset (they are lost only on a true power
+ * cycle). After the reset, the boot-time park loop replays the saved dump
+ * periodically, so a terminal attached at ANY later time sees the complete
+ * system state from the moment of failure.
+ *
+ * Validity is guarded by magic + FNV-1a checksum: if the bootloader or a power
+ * glitch clobbers the region, FaultHandler_GetSavedStallDump() simply returns
+ * NULL instead of garbage.
+ */
+
+/**
+ * @brief Start capturing a new stall dump (invalidates any previous one).
+ */
+void FaultHandler_StallDumpBegin(void);
+
+/**
+ * @brief printf that tees: writes to stdout AND appends to the persistent
+ *        stall-dump buffer (silently truncates once the buffer is full).
+ *        Only meaningful between StallDumpBegin() and StallDumpCommit().
+ */
+__attribute__((format(printf, 1, 2)))
+void FaultHandler_StallDumpPrintf(const char *fmt, ...);
+
+/**
+ * @brief Seal the captured dump (checksum + magic) so it can be recognised as
+ *        valid after the upcoming watchdog reset.
+ */
+void FaultHandler_StallDumpCommit(void);
+
+/**
+ * @brief Retrieve the stall dump saved by the PREVIOUS boot.
+ *
+ * @return NUL-terminated dump text, or NULL if none survived (fresh power-on,
+ *         clobbered RAM, or no stall was ever recorded). Statically owned.
+ */
+const char *FaultHandler_GetSavedStallDump(void);
+
 #endif /* FAULT_HANDLER_H */
