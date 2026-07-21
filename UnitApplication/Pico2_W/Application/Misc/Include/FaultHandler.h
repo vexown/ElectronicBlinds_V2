@@ -318,9 +318,15 @@ const char *FaultHandler_GetLastCause(void);
 void FaultHandler_StallDumpBegin(void);
 
 /**
- * @brief printf that tees: writes to stdout AND appends to the persistent
- *        stall-dump buffer (silently truncates once the buffer is full).
- *        Only meaningful between StallDumpBegin() and StallDumpCommit().
+ * @brief Append one formatted line to the persistent stall-dump buffer.
+ *
+ * Buffer-ONLY: this does not print anywhere live, on purpose. It is lock-free
+ * and bounded so the whole dump can be built and sealed before any blocking
+ * I/O. A stall usually means a task is wedged holding the stdio print mutex, so
+ * printing from here (as an earlier version did) deadlocks the supervisor and
+ * nothing survives the reset. Live output is StallDumpEcho()'s job, after the
+ * seal. Silently truncates once the buffer is full. Only meaningful between
+ * StallDumpBegin() and StallDumpCommit().
  */
 __attribute__((format(printf, 1, 2)))
 void FaultHandler_StallDumpPrintf(const char *fmt, ...);
@@ -330,6 +336,18 @@ void FaultHandler_StallDumpPrintf(const char *fmt, ...);
  *        valid after the upcoming watchdog reset.
  */
 void FaultHandler_StallDumpCommit(void);
+
+/**
+ * @brief Best-effort LIVE echo of the sealed dump to the raw UART.
+ *
+ * Call AFTER StallDumpCommit(). Emits the buffer via lock-free raw UART writes
+ * (never printf), so it reaches a terminal recording the port even when the
+ * stdio mutex is held by whatever wedged the system. No-op if no dump is
+ * sealed. This is the deadlock-proof capture path; the reset-surviving RAM
+ * copy replayed by the next boot's park loop is the fallback for when nobody
+ * was recording.
+ */
+void FaultHandler_StallDumpEcho(void);
 
 /**
  * @brief Retrieve the stall dump saved by the PREVIOUS boot.

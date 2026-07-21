@@ -766,32 +766,61 @@ void FaultHandler_StallDumpBegin(void)
 
 void FaultHandler_StallDumpPrintf(const char *fmt, ...)
 {
-    va_list args;
-    va_list argsCopy;
-    va_start(args, fmt);
-    va_copy(argsCopy, args);
+    /* Buffer-only, lock-free and bounded. Deliberately does NOT touch stdio.
+     *
+     * The whole dump must be built and sealed (StallDumpCommit) BEFORE any
+     * blocking I/O, because a stall frequently means some task is wedged while
+     * holding the pico-sdk stdio print mutex (the network task, for instance,
+     * logs constantly and is a prime candidate to be stuck mid-printf). A
+     * vprintf() here would then block the supervisor on that very mutex, the
+     * dump would never be committed, and nothing would survive the reset - which
+     * is exactly the "no stall dump survived" failure seen on 2026-07-21.
+     * Live output is done separately and lock-free by StallDumpEcho(), AFTER
+     * the buffer is sealed. */
+    if (s_stallDump.len >= (uint32_t)sizeof(s_stallDump.text) - 1U)
+    {
+        return; /* buffer full - silently truncate */
+    }
 
-    vprintf(fmt, args);
+    va_list args;
+    va_start(args, fmt);
+
+    uint32_t space   = (uint32_t)sizeof(s_stallDump.text) - s_stallDump.len;
+    int      written = vsnprintf(&s_stallDump.text[s_stallDump.len], (size_t)space, fmt, args);
     va_end(args);
 
-    if (s_stallDump.len < (uint32_t)sizeof(s_stallDump.text) - 1U)
+    if (written > 0)
     {
-        uint32_t space = (uint32_t)sizeof(s_stallDump.text) - s_stallDump.len;
-        int written = vsnprintf(&s_stallDump.text[s_stallDump.len], (size_t)space, fmt, argsCopy);
-        if (written > 0)
-        {
-            uint32_t addedLen = (uint32_t)written;
-            /* vsnprintf reports what it WOULD have written; clamp on truncation */
-            s_stallDump.len += (addedLen < space) ? addedLen : (space - 1U);
-        }
+        uint32_t addedLen = (uint32_t)written;
+        /* vsnprintf reports what it WOULD have written; clamp on truncation */
+        s_stallDump.len += (addedLen < space) ? addedLen : (space - 1U);
     }
-    va_end(argsCopy);
 }
 
 void FaultHandler_StallDumpCommit(void)
 {
     s_stallDump.crc   = fnv1a32_buf(s_stallDump.text, s_stallDump.len);
     s_stallDump.magic = STALL_DUMP_MAGIC;
+}
+
+void FaultHandler_StallDumpEcho(void)
+{
+    /* Best-effort LIVE echo of the just-sealed dump, for the (now common) case
+     * where a terminal is recording the UART at stall time. Uses the raw,
+     * lock-free UART path - NOT printf - for the same reason StallDumpPrintf
+     * avoids stdio: whatever wedged the system may be holding the stdio mutex,
+     * so a printf here could deadlock. Raw register writes cannot. stdio on this
+     * board is UART (USB disabled), so this reaches the exact port being
+     * recorded. If nobody is listening it is harmless; the sealed RAM copy is
+     * what the next boot replays regardless. Must run AFTER StallDumpCommit(). */
+    if (s_stallDump.magic != STALL_DUMP_MAGIC)
+    {
+        return;
+    }
+    for (uint32_t i = 0; i < s_stallDump.len; i++)
+    {
+        uart_putc_raw(uart_default, s_stallDump.text[i]);
+    }
 }
 
 const char *FaultHandler_GetSavedStallDump(void)

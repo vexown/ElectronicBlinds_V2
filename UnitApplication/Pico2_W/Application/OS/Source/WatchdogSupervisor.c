@@ -148,8 +148,10 @@ static const char *cyw43LockHolderName(void)
  *   - no hog and even this (highest-priority) task barely running -> a
  *     scheduler-level block (long critical section / IRQs off / ISR storm).
  *
- * Uses printf (not LOG) so the dump reaches the UART even if the TCP debug
- * client is gone or the network task is the thing that wedged.
+ * The dump is built into a reset-surviving buffer (lock-free, no stdio) and
+ * sealed, THEN echoed live to the raw UART. Neither step touches the stdio
+ * print mutex, so it cannot deadlock against a task that wedged mid-printf -
+ * which is precisely the situation a stall on the CYW43/network path creates.
  *
  * Parameters:
  *   - stalledForMs: how long the heartbeat had been stale at detection
@@ -233,8 +235,12 @@ static void dumpSystemStateOnStall(uint32_t stalledForMs)
 		   (unsigned long)WATCHDOG_TIMEOUT_MS);
 	FaultHandler_StallDumpPrintf("=========================================================\n");
 
-	/* Seal the RAM copy so the next boot recognises it as valid. */
+	/* Seal the RAM copy so the next boot recognises it as valid, THEN echo it
+	 * live over the raw UART. The seal happens first and lock-free, so even if
+	 * the echo (or the impending reset) is cut short the dump still survives for
+	 * the next boot's park loop to replay. */
 	FaultHandler_StallDumpCommit();
+	FaultHandler_StallDumpEcho();
 }
 
 /*
