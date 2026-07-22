@@ -29,6 +29,9 @@
 #include "OS_manager.h"          /* MAX_NUM_OF_TASKS */
 #include "WatchdogSupervisor.h"
 
+/* Driver includes */
+#include "h_bridge_controller.h" /* HBridge_Stop - motors off before freezing forever */
+
 /* Misc includes */
 #include "Common.h"              /* LOG, CriticalErrorHandler, module/error IDs, NON_BLOCKING */
 #include "FaultHandler.h"        /* FaultHandler_RecordWatchdogStall */
@@ -53,6 +56,25 @@
  * scheduler-level hangs quickly (a 1.5 s deadline was tripped by a single slow
  * wifi-chip ioctl on 2026-07). */
 #define ALIVE_STALL_DEADLINE_MS 	((uint32_t)4000)
+
+/* DEBUG (stall hunt): when a stall is detected, FREEZE instead of resetting -
+ * keep petting the watchdog forever and re-dump the live system state every
+ * FREEZE_REDUMP_TICKS supervisor ticks.
+ *
+ * Rationale: every reset-based capture path we tried loses the evidence. The
+ * dump has to survive a watchdog reset in RAM the bootloader may reuse, and a
+ * terminal has to be recording at the exact moment of the reset. Staying alive
+ * removes both problems - the stalled state simply sits there, reprinting, until
+ * someone plugs in a UART adapter, whether that is 10 seconds or 10 hours later.
+ *
+ * This is safe because the supervisor runs at configMAX_PRIORITIES-2 (only the
+ * timer task is above it) and, by definition, it is running - it just detected
+ * the stall - so it can keep the hardware watchdog fed. Motors are stopped on
+ * entry, because "never reset" means nothing else will stop them.
+ *
+ * Revert together with the other stall-hunt DEBUG commits once the root cause is
+ * found; the production policy is reset-and-continue. */
+#define FREEZE_REDUMP_TICKS 		((uint32_t)20)   /* 20 * 250 ms = ~5 s */
 
 /*******************************************************************************/
 /*                             STATIC VARIABLES                                */
@@ -86,11 +108,16 @@ static TaskStatus_t snapPrev[MAX_NUM_OF_TASKS];
 static UBaseType_t  snapPrevCount = 0;
 static configRUN_TIME_COUNTER_TYPE prevTotalRunTime = 0;
 
+/* DEBUG (stall hunt): how many stall dumps have been emitted this power cycle.
+ * >1 means the freeze park is reprinting. */
+static uint32_t s_dumpCount = 0;
+
 /*******************************************************************************/
 /*                       STATIC FUNCTION DECLARATIONS                          */
 /*******************************************************************************/
 
 static void dumpSystemStateOnStall(uint32_t stalledForMs);
+static void freezeForInspection(void);
 static void printSavedStallDump(void);
 static const char *cyw43LockHolderName(void);
 
@@ -178,7 +205,13 @@ static void dumpSystemStateOnStall(uint32_t stalledForMs)
 	 * boot-time park can replay this dump to a terminal attached AFTER the fact. */
 	FaultHandler_StallDumpBegin();
 
-	FaultHandler_StallDumpPrintf("\n========== WATCHDOG SUPERVISOR: STALL DETECTED ==========\n");
+	/* Numbered so repeats are distinguishable while frozen: comparing consecutive
+	 * dumps shows whether the wedge is static (same holder, no CPU moving) or the
+	 * system is churning. */
+	s_dumpCount++;
+
+	FaultHandler_StallDumpPrintf("\n===== WATCHDOG SUPERVISOR: STALL DETECTED (dump #%lu) =====\n",
+		   (unsigned long)s_dumpCount);
 	FaultHandler_StallDumpPrintf("Uptime: %lu ms\n",
 		   (unsigned long)(xTaskGetTickCount() * portTICK_PERIOD_MS));
 	FaultHandler_StallDumpPrintf("Monitored task heartbeat stalled for ~%lu ms (deadline %lu ms)\n",
@@ -231,8 +264,9 @@ static void dumpSystemStateOnStall(uint32_t stalledForMs)
 	/* DEBUG: the canary's only indefinite block is the CYW43 lock, so if it is
 	 * shown Blocked above, this names the task hogging that lock - the suspect. */
 	FaultHandler_StallDumpPrintf("CYW43 async_context lock currently held by: %s\n", cyw43LockHolderName());
-	FaultHandler_StallDumpPrintf("No longer petting the watchdog -> board resets within ~%lu ms.\n",
-		   (unsigned long)WATCHDOG_TIMEOUT_MS);
+	FaultHandler_StallDumpPrintf("FROZEN for inspection - watchdog still being petted, NO reset.\n"
+		   "This dump repeats every ~%lu ms. Power-cycle to recover.\n",
+		   (unsigned long)(FREEZE_REDUMP_TICKS * 250U));
 	FaultHandler_StallDumpPrintf("=========================================================\n");
 
 	/* Seal the RAM copy so the next boot recognises it as valid, THEN echo it
@@ -241,6 +275,55 @@ static void dumpSystemStateOnStall(uint32_t stalledForMs)
 	 * the next boot's park loop to replay. */
 	FaultHandler_StallDumpCommit();
 	FaultHandler_StallDumpEcho();
+}
+
+/*
+ * Function: freezeForInspection
+ *
+ * Description: DEBUG (stall hunt). Never returns. Instead of letting the board
+ * reset, hold it in the stalled state indefinitely and keep re-dumping, so the
+ * evidence waits for the observer instead of the other way round.
+ *
+ * Why this beats every reset-based capture we tried: a reset destroys the live
+ * state, so the dump had to survive in RAM the bootloader may reuse, AND a
+ * terminal had to be recording at the exact instant of the crash. Three stalls in
+ * a row produced nothing usable for exactly those reasons. Frozen, the board just
+ * keeps reprinting the full task table until someone connects.
+ *
+ * Mechanics:
+ *   - the hardware watchdog keeps being petted here, so it never fires;
+ *   - vTaskDelay (not busy-wait) is used deliberately: the rest of the system
+ *     keeps running exactly as it was, so the wedge stays genuine and the Win%
+ *     column keeps showing who is really burning CPU;
+ *   - each redump re-samples live state and echoes it over the raw, lock-free
+ *     UART path, so it cannot deadlock on the stdio mutex;
+ *   - the CPU window in every redump is measured against the LAST HEALTHY cycle's
+ *     snapshot, so Win% accumulates over the whole frozen period - a hog stands
+ *     out more with every repeat.
+ *
+ * Motors are stopped first: "never reset" also means nothing else will ever stop
+ * them, and a blind driving into its end stop for hours is a real hazard.
+ *
+ * Parameters: none
+ *
+ * Returns: never
+ */
+static void freezeForInspection(void)
+{
+	(void)HBridge_Stop();
+
+	for ( ;; )
+	{
+		for (uint32_t i = 0; i < FREEZE_REDUMP_TICKS; i++)
+		{
+			watchdog_update();
+			vTaskDelay(pdMS_TO_TICKS(250));
+		}
+
+		uint32_t stalledForMs =
+			(uint32_t)pdTICKS_TO_MS(xTaskGetTickCount() - s_lastProgressTick);
+		dumpSystemStateOnStall(stalledForMs);
+	}
 }
 
 /*
@@ -390,7 +473,7 @@ void WatchdogSupervisor_MainFunction(void)
 	if (sinceProgressMs >= ALIVE_STALL_DEADLINE_MS)
 	{
 		/* Stall: leave a cross-reset breadcrumb (so the cause is announced on the
-		 * next boot too), print a full live dump, then stop petting.
+		 * next boot too), print a full live dump, then freeze for inspection.
 		 *
 		 * The breadcrumb carries the monitored task's state plus the CYW43 lock
 		 * holder: for the common Blocked case that names the culprit in the park
@@ -404,6 +487,12 @@ void WatchdogSupervisor_MainFunction(void)
 		FaultHandler_RecordWatchdogStall((uint32_t)st, holder);
 		dumpSystemStateOnStall(sinceProgressMs);
 		s_stalled = true;
+
+		/* DEBUG (stall hunt): do NOT stop petting - freeze here instead and keep
+		 * reprinting the live state forever. Never returns. The breadcrumb above
+		 * is still recorded so that an unrelated reset (brownout, power blip)
+		 * would still be explained on the next boot. */
+		freezeForInspection();
 	}
 	else
 	{
