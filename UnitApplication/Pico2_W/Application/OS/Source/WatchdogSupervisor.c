@@ -117,6 +117,7 @@ static uint32_t s_dumpCount = 0;
 /*******************************************************************************/
 
 static void dumpSystemStateOnStall(uint32_t stalledForMs);
+static void dumpCyw43Probe(void);
 static void freezeForInspection(void);
 static void printSavedStallDump(void);
 static const char *cyw43LockHolderName(void);
@@ -249,13 +250,15 @@ static void dumpSystemStateOnStall(uint32_t stalledForMs)
 		configRUN_TIME_COUNTER_TYPE winUs = snapNow[i].ulRunTimeCounter - prevRun;
 		unsigned long winPct = (unsigned long)(((uint64_t)winUs * 100U) / totalWindow);
 
-		FaultHandler_StallDumpPrintf("%-16s %c  %2lu  %6lu  %8lu  %8lu  %3lu\n",
+		/* 64-bit run-time counters (configRUN_TIME_COUNTER_TYPE): print with %llu
+		 * so nothing is truncated on a long-running board. */
+		FaultHandler_StallDumpPrintf("%-16s %c  %2lu  %6lu  %8llu  %8llu  %3lu\n",
 			   snapNow[i].pcTaskName,
 			   st,
 			   (unsigned long)snapNow[i].uxCurrentPriority,
 			   (unsigned long)snapNow[i].usStackHighWaterMark,
-			   (unsigned long)(snapNow[i].ulRunTimeCounter / 1000U),
-			   (unsigned long)winUs,
+			   (unsigned long long)(snapNow[i].ulRunTimeCounter / 1000U),
+			   (unsigned long long)winUs,
 			   winPct);
 	}
 
@@ -264,6 +267,12 @@ static void dumpSystemStateOnStall(uint32_t stalledForMs)
 	/* DEBUG: the canary's only indefinite block is the CYW43 lock, so if it is
 	 * shown Blocked above, this names the task hogging that lock - the suspect. */
 	FaultHandler_StallDumpPrintf("CYW43 async_context lock currently held by: %s\n", cyw43LockHolderName());
+
+	/* DEBUG: bus-level probe - explains WHY the ioctls are timing out, which the
+	 * task table above cannot show (it only ever names whoever queued on the
+	 * lock, which is a symptom). */
+	dumpCyw43Probe();
+
 	FaultHandler_StallDumpPrintf("FROZEN for inspection - watchdog still being petted, NO reset.\n"
 		   "This dump repeats every ~%lu ms. Power-cycle to recover.\n",
 		   (unsigned long)(FREEZE_REDUMP_TICKS * 250U));
@@ -275,6 +284,98 @@ static void dumpSystemStateOnStall(uint32_t stalledForMs)
 	 * the next boot's park loop to replay. */
 	FaultHandler_StallDumpCommit();
 	FaultHandler_StallDumpEcho();
+}
+
+/*
+ * Function: dumpCyw43Probe
+ *
+ * Description: DEBUG (stall hunt). Interrogates the CYW43 wifi chip's bus
+ * interface at stall time to explain WHY every ioctl is timing out.
+ *
+ * Background. The driver logs `STALL(0;204-204): timeout` - see
+ * cyw43_sdpcm_send_common() in cyw43_ll.c. Decoded that is wlan_flow_control=0,
+ * tx sequence=204, last granted bus credit=204. The host may only send while
+ * those two differ, so we have spent every credit the chip granted and the chip
+ * has granted no more. Credits are only ever refreshed by the header of a packet
+ * RECEIVED from the chip, so a chip that sends nothing stalls the host forever.
+ *
+ * The decisive question is therefore whether the chip is still asking to be
+ * serviced. cyw43_ll_sdpcm_poll_device() (cyw43_ll.c:1016) begins with:
+ *
+ *     if (!self->had_successful_packet && !cyw43_cb_read_host_interrupt_pin(...))
+ *         return -1;
+ *
+ * i.e. the poll is gated entirely on the WL_HOST_WAKE pin (GP24). If that pin is
+ * low the driver returns immediately WITHOUT TOUCHING THE BUS - so a full second
+ * of "polling" can consist of never talking to the chip at all. Sampling the pin
+ * splits the diagnosis cleanly:
+ *
+ *   - pin never asserts  -> the chip is not requesting service. It is hung,
+ *     crashed or asleep; the host is waiting on a radio that will never speak.
+ *   - pin asserted/toggling -> the chip IS asking for service and the host-side
+ *     receive path is failing to drain it (bus/PIO desync, or an interrupt being
+ *     cleared without the packet being consumed).
+ *
+ * Worth knowing: the driver's own stall recovery - the "do poke" of the SDIO
+ * mailbox at cyw43_ll.c:650 - is inside `#if !CYW43_USE_SPI`, and Pico W /
+ * Pico 2 W set CYW43_USE_SPI=1. On this board that poke is compiled out, so the
+ * stall loop is purely passive: it polls a pin for one second and gives up. There
+ * is no mechanism anywhere in that path to nudge a wedged chip.
+ *
+ * Safety: everything here is either a GPIO read or a plain read of a
+ * cyw43_state field. Nothing acquires the CYW43 lock (the stalled task is
+ * holding it) and nothing issues a bus transaction, so this cannot deadlock and
+ * cannot disturb the wedged state we are trying to observe. Deliberately does
+ * NOT call cyw43_wifi_link_status() etc - those take CYW43_THREAD_ENTER.
+ *
+ * Parameters: none
+ *
+ * Returns: void
+ */
+static void dumpCyw43Probe(void)
+{
+	/* Sample WL_HOST_WAKE tightly for ~50 ms. A single read could easily miss a
+	 * brief service request, and "did it ever go high" is exactly the datum that
+	 * decides chip-side vs host-side. Busy-sampled rather than delayed so short
+	 * pulses are actually caught; 50 ms at this priority is harmless. */
+	const uint64_t sampleWindowUs = 50000U;
+	uint32_t samples    = 0;
+	uint32_t highs      = 0;
+	uint32_t transitions = 0;
+	int      last       = cyw43_cb_read_host_interrupt_pin(NULL);
+	int      first      = last;
+
+	uint64_t t0 = time_us_64();
+	while ((time_us_64() - t0) < sampleWindowUs)
+	{
+		int now = cyw43_cb_read_host_interrupt_pin(NULL);
+		samples++;
+		if (now) { highs++; }
+		if (now != last) { transitions++; last = now; }
+	}
+
+	FaultHandler_StallDumpPrintf("--- CYW43 bus probe ---\n");
+	FaultHandler_StallDumpPrintf("WL_HOST_WAKE(GP%u): first=%d last=%d high=%lu/%lu samples, %lu transitions over %lu ms\n",
+		   (unsigned)CYW43_PIN_WL_HOST_WAKE, first, last,
+		   (unsigned long)highs, (unsigned long)samples,
+		   (unsigned long)transitions,
+		   (unsigned long)(sampleWindowUs / 1000U));
+	FaultHandler_StallDumpPrintf("cyw43_ll_has_work: %s\n",
+		   cyw43_ll_has_work(&cyw43_state.cyw43_ll) ? "YES (chip wants service)" : "no (chip silent)");
+
+	/* Driver-level state, read without the lock - tells us whether the driver
+	 * still believes it is associated while the chip is unreachable. */
+	FaultHandler_StallDumpPrintf("cyw43_state: initted=%d itf_state=0x%02x join_state=0x%lx scan_state=0x%lx\n",
+		   (int)cyw43_state.initted,
+		   (unsigned)cyw43_state.itf_state,
+		   (unsigned long)cyw43_state.wifi_join_state,
+		   (unsigned long)cyw43_state.wifi_scan_state);
+	FaultHandler_StallDumpPrintf("cyw43_state pending: disassoc=%d rejoin=%d rejoin_wpa=%d\n",
+		   (int)cyw43_state.pend_disassoc,
+		   (int)cyw43_state.pend_rejoin,
+		   (int)cyw43_state.pend_rejoin_wpa);
+	FaultHandler_StallDumpPrintf("Read as: pin never high -> chip hung/asleep (chip-side). "
+		   "pin high or toggling -> host RX path not draining it (host-side).\n");
 }
 
 /*

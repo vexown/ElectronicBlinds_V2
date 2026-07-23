@@ -149,29 +149,34 @@ void Monitor_initRuntimeCounter(void)
  * Function: Monitor_getRuntimeCounter
  * 
  * Description: Function provided for portGET_RUN_TIME_COUNTER_VALUE macro in FreeConfig.h
- * Returns the time since start based on the current value of System Timer and the 'start' value
+ * Returns the time since start based on the current value of System Timer and the 'start' value.
+ *
+ * NOTE: this returns 64 bits (configRUN_TIME_COUNTER_TYPE is uint64_t to match).
+ * It used to return unsigned long and CLAMP to ULONG_MAX, which at 1 us
+ * resolution meant the counter stopped advancing after ~71.6 minutes of uptime.
+ * FreeRTOS then accumulated a zero delta into every task, so all per-task
+ * run-time totals froze silently and the watchdog stall dump's LifeMs/WinUs/Win%
+ * columns reported stale values with no hint they were stale - which cost real
+ * time during the 2026-07 stall hunt. 64 bits of microseconds lasts ~584000
+ * years, so the clamp is simply gone.
+ *
  * Parameters:
  *   - none
- * 
- * Returns: unsigned long (microseconds since start)
+ *
+ * Returns: uint64_t (microseconds since start)
  *
  */
-unsigned long Monitor_getRuntimeCounter(void) 
+uint64_t Monitor_getRuntimeCounter(void)
 {
     absolute_time_t current_time = get_absolute_time(); //returns the absolute time (now) of Pico's System Timer (hardware timer)
     int64_t time_diff_us = absolute_time_diff_us(stats_start_time, current_time);
 
-    if (time_diff_us < 0) 
+    if (time_diff_us < 0)
     {
         time_diff_us = 0; //if the time difference is negative, return 0 (should never happen but just in case)
     }
 
-    if (time_diff_us > ULONG_MAX)
-    {
-        time_diff_us = ULONG_MAX; //if the time difference is too large, return the maximum value of an unsigned long
-    }
-    
-    return (unsigned long)time_diff_us;
+    return (uint64_t)time_diff_us;
 }
 
 /*******************************************************************************/

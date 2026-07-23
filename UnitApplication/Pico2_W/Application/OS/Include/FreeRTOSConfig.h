@@ -50,8 +50,11 @@
 extern void Monitor_initRuntimeCounter(void);
 
 /* Function provided for portGET_RUN_TIME_COUNTER_VALUE macro in FreeConfig.h
- * Returns the time since start based on the current value of System Timer and the 'start' value */
-extern unsigned long Monitor_getRuntimeCounter(void);
+ * Returns the time since start based on the current value of System Timer and the 'start' value.
+ * 64-bit: a 32-bit microsecond counter saturates after only ~71.6 min of uptime
+ * (ULONG_MAX us), which silently froze every task's run-time total and made the
+ * CPU columns of the watchdog stall dump meaningless on any long-running board. */
+extern uint64_t Monitor_getRuntimeCounter(void);
 
 /* Function provided for configASSERT macro in FreeRTOSConfig.h
  * Called if an assertion passed to configASSERT() fails. */
@@ -385,8 +388,14 @@ extern void vAssertCalled( const char *pcFile, unsigned long ulLine );
  * 0 if left undefined.  See https://www.freertos.org/rtos-run-time-stats.html.
  */
 #define configGENERATE_RUN_TIME_STATS           1
-#define portCONFIGURE_TIMER_FOR_RUN_TIME_STATS()   Monitor_initRuntimeCounter() 
+#define portCONFIGURE_TIMER_FOR_RUN_TIME_STATS()   Monitor_initRuntimeCounter()
 #define portGET_RUN_TIME_COUNTER_VALUE()           Monitor_getRuntimeCounter()
+
+/* 64-bit run-time counter. The default is uint32_t, which at 1 us resolution
+ * wraps/saturates after ~71.6 minutes - far shorter than this board's uptime, so
+ * every per-task ulRunTimeCounter froze and the stall dump's LifeMs/Win% columns
+ * became stale garbage without any indication. */
+#define configRUN_TIME_COUNTER_TYPE             uint64_t
 
 /* Set configUSE_TRACE_FACILITY to include additional task structure members
  * are used by trace and visualisation functions and tools.  Set to 0 to exclude

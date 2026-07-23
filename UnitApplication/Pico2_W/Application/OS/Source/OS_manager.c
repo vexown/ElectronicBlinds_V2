@@ -100,6 +100,14 @@
 #define BLINDS_TASK_PERIOD_TICKS			pdMS_TO_TICKS(BLINDS_TASK_PERIOD_MS)
 #define WATCHDOG_SUPERVISOR_PERIOD_TICKS	pdMS_TO_TICKS(250)  //250ms - pets the watchdog ~8x per timeout window
 
+/* A cyw43_gpio_set() that takes at least this long has hit the pico-sdk SDPCM
+ * timeout (CYW43_IOCTL_TIMEOUT_US, 1 s) rather than actually talking to the chip.
+ * Needed because cyw43_ll_gpio_set() discards the ioctl error and always returns
+ * 0, so duration is the only evidence the application gets. Comfortably between
+ * the worst legal blink measured on this board (~305 ms, during a wifi join) and
+ * the observed timeout duration (~1005 ms). */
+#define CYW43_IOCTL_TIMEOUT_LIKELY_US		((uint32_t)950000)
+
 /* Stack sizes - This parameter is in WORDS (on Pico W: 1 word = 32bit = 4bytes) */ 
 #define STACK_1024_BYTES					(configSTACK_DEPTH_TYPE)(256) 
 #define STACK_2048_BYTES					(configSTACK_DEPTH_TYPE)(512) 
@@ -447,6 +455,11 @@ static void aliveTask(__unused void *taskParams)
 		 * watchdog-trap commits. */
 		uint64_t dbgT0Us = time_us_64();
 
+		/* How long the ioctl actually took, hoisted out of the DEBUG block below
+		 * because the health check needs it (see the failure handling further
+		 * down - the driver discards the real error, so duration is the signal). */
+		uint32_t dbgGpioUsForHealth = 0;
+
 		/* Acquire the lock */
 		async_context_acquire_lock_blocking(context);
 
@@ -464,6 +477,8 @@ static void aliveTask(__unused void *taskParams)
 			uint64_t dbgT2Us = time_us_64();
 			uint32_t dbgLockUs = (uint32_t)(dbgT1Us - dbgT0Us);
 			uint32_t dbgGpioUs = (uint32_t)(dbgT2Us - dbgT1Us);
+
+			dbgGpioUsForHealth = dbgGpioUs;
 
 			static uint32_t dbgCount = 0;
 			static uint32_t dbgLockMaxUs = 0;
@@ -504,12 +519,28 @@ static void aliveTask(__unused void *taskParams)
 			}
 		}
 
-		/* Check if the LED was set successfully */
-		if(ret != 0)
+		/* Check if the LED was set successfully.
+		 *
+		 * 'ret' alone is NOT a sufficient health check: cyw43_ll_gpio_set()
+		 * (cyw43_ll.c) ends with a bare `return 0` and throws away the result of
+		 * the underlying cyw43_write_iovar_u32_u32() ioctl, so cyw43_gpio_set()
+		 * reports success even when the ioctl timed out. During the 2026-07-23
+		 * capture the wifi chip was completely unreachable for 15.6 hours and this
+		 * branch never fired once - the application was blind to a dead radio.
+		 *
+		 * So also treat a blink that took as long as the pico-sdk ioctl timeout
+		 * (CYW43_IOCTL_TIMEOUT_US, 1 s) as a failure. A healthy gpio_set is a few
+		 * ms; only a timed-out SDPCM exchange takes ~1005 ms, which makes the
+		 * duration a reliable proxy for the error the driver discarded. */
+		bool ledTimedOut = (dbgGpioUsForHealth >= CYW43_IOCTL_TIMEOUT_LIKELY_US);
+
+		if((ret != 0) || ledTimedOut)
 		{
 			consecutiveFailures++;
-			LOG("LED failure number %d \n", consecutiveFailures);
-			
+			LOG("LED failure number %d (ret=%d, gpio_set %lu us%s)\n",
+				consecutiveFailures, ret, (unsigned long)dbgGpioUsForHealth,
+				ledTimedOut ? ", ioctl TIMEOUT - wifi chip not responding" : "");
+
 			if(consecutiveFailures >= 3)
 			{
 				/* If the LED fails to set 3 times in a row, enter error state */
