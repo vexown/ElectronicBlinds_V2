@@ -95,7 +95,8 @@
 /* Task periods */
 #define ALIVE_TASK_PERIOD_TICKS			    pdMS_TO_TICKS(500)  //500ms
 #define NETWORK_TASK_PERIOD_TICKS			pdMS_TO_TICKS(200)  //200ms
-#define WIFI_RETRY_DELAY_TICKS				pdMS_TO_TICKS(30000) //30s
+#define WIFI_RETRY_DELAY_TICKS				pdMS_TO_TICKS(30000) //30s - first retry
+#define WIFI_RETRY_DELAY_MAX_TICKS			pdMS_TO_TICKS(900000) //15min - backoff ceiling
 #define MONITOR_TASK_PERIOD_TICKS			pdMS_TO_TICKS(11000) //11s
 #define BLINDS_TASK_PERIOD_TICKS			pdMS_TO_TICKS(BLINDS_TASK_PERIOD_MS)
 #define WATCHDOG_SUPERVISOR_PERIOD_TICKS	pdMS_TO_TICKS(250)  //250ms - pets the watchdog ~8x per timeout window
@@ -394,10 +395,24 @@ static void networkTask(__unused void *taskParams)
 #if (PICO_AS_ACCESS_POINT == ON)
 	setupWifiAccessPoint();
 #else
+	/* Retry with exponential backoff rather than hammering the access point.
+	 * A router that is up but misbehaving (associating and authenticating, then
+	 * never completing the WPA handshake) previously drew 72 join attempts in 75
+	 * minutes, and that churn is the only condition under which the wifi chip has
+	 * ever been seen to wedge. Backing off costs nothing when the AP is healthy -
+	 * the first retry is still 30 s - and stops us pounding one that is not. */
+	TickType_t retryDelay = WIFI_RETRY_DELAY_TICKS;
 	while (connectToWifi() == false)
 	{
-		LOG("Wi-Fi connect failed, retrying in 30s...\n");
-		vTaskDelay(WIFI_RETRY_DELAY_TICKS);
+		LOG("Wi-Fi connect failed, retrying in %lus...\n",
+			(unsigned long)(pdTICKS_TO_MS(retryDelay) / 1000U));
+		vTaskDelay(retryDelay);
+
+		retryDelay *= 2;
+		if (retryDelay > WIFI_RETRY_DELAY_MAX_TICKS)
+		{
+			retryDelay = WIFI_RETRY_DELAY_MAX_TICKS;
+		}
 	}
 #endif
 
@@ -408,20 +423,110 @@ static void networkTask(__unused void *taskParams)
 	{
         vTaskDelay(NETWORK_TASK_PERIOD_TICKS);
 
+		/* Power-cycle the wifi chip if it has stopped answering. Runs here rather
+		 * than in the alive task that detects it because this task owns the wifi
+		 * lifecycle and can block for the rejoin without starving anything. */
+		WiFi_ServiceRadioRecovery();
+
 		WiFi_MainFunction();
 	}
 
 }
 
-/* 
+#if (ALIVE_LED_ENABLED == ON)
+/*
+ * Function: serviceAliveLed
+ *
+ * Description: Toggles the alive LED once and judges whether the wifi chip is
+ * still answering. The LED is WL_GPIO0 on the CYW43 chip, so every blink is an
+ * SPI ioctl - which makes it a free health check on the radio, and the reason
+ * this lives in its own function: the caller skips it entirely while the chip
+ * is being power-cycled.
+ *
+ * Parameters: none
+ *
+ * Returns: void
+ */
+static void serviceAliveLed(void)
+{
+	static bool state_LED;
+	static uint8_t consecutiveFailures = 0;
+
+	state_LED = !state_LED; // Toggle the state of the LED
+
+	/* Get the async context from the CYW43 driver. async_context is a data structure used for managing asynchronous operations
+		in a thread-safe manner. It maintains an internal event queue where asynchronous events are posted and processed.
+		In FreeRTOS where we use the pico_cyw43_arch_lwip_sys_freertos library, a dedicated task is used to process these events */
+	async_context_t *context = cyw43_arch_async_context();
+
+	/* Acquire the lock */
+	async_context_acquire_lock_blocking(context);
+
+	/* Time the ioctl itself. This is not instrumentation - it is the health
+	 * check: cyw43_ll_gpio_set() discards the ioctl's error and always
+	 * returns 0, so its duration is the only evidence we get that the wifi
+	 * chip stopped answering (see the failure handling below). */
+	uint64_t ioctlStartUs = time_us_64();
+
+	/* Set the state of the LED */
+	int ret = cyw43_gpio_set(&cyw43_state, CYW43_WL_GPIO_LED_PIN, state_LED);
+
+	uint32_t ioctlUs = (uint32_t)(time_us_64() - ioctlStartUs);
+
+	/* Release the lock */
+	async_context_release_lock(context);
+
+	/* Check if the LED was set successfully.
+	 *
+	 * 'ret' alone is NOT a sufficient health check: cyw43_ll_gpio_set()
+	 * (cyw43_ll.c) ends with a bare `return 0` and throws away the result of
+	 * the underlying cyw43_write_iovar_u32_u32() ioctl, so cyw43_gpio_set()
+	 * reports success even when the ioctl timed out. During the 2026-07-23
+	 * capture the wifi chip was completely unreachable for 15.6 hours and this
+	 * branch never fired once - the application was blind to a dead radio.
+	 *
+	 * So also treat a blink that took as long as the pico-sdk ioctl timeout
+	 * (CYW43_IOCTL_TIMEOUT_US, 1 s) as a failure. A healthy gpio_set is a few
+	 * ms; only a timed-out SDPCM exchange takes ~1005 ms, which makes the
+	 * duration a reliable proxy for the error the driver discarded. */
+	bool ledTimedOut = (ioctlUs >= CYW43_IOCTL_TIMEOUT_LIKELY_US);
+
+	if((ret != 0) || ledTimedOut)
+	{
+		consecutiveFailures++;
+		LOG("LED failure number %d (ret=%d, gpio_set %lu us%s)\n",
+			consecutiveFailures, ret, (unsigned long)ioctlUs,
+			ledTimedOut ? ", ioctl TIMEOUT - wifi chip not responding" : "");
+
+		if(consecutiveFailures >= LED_FAILURES_BEFORE_ERROR)
+		{
+			/* The wifi chip has stopped answering. Ask for it to be power-cycled
+			 * rather than parking the board: the blinds do not need the radio to
+			 * work, so a dead radio must not take the whole controller down. The
+			 * network task performs the recovery; the caller stops calling us
+			 * meanwhile, so we neither fight it for the CYW43 lock nor burn a 1 s
+			 * timeout per iteration. */
+			WiFi_RequestRadioRecovery();
+			consecutiveFailures = 0;
+		}
+	}
+	else
+	{
+		/* Reset the counter if the LED was set successfully */
+		consecutiveFailures = 0;
+	}
+}
+#endif /* ALIVE_LED_ENABLED == ON */
+
+/*
  * Function: aliveTask
- * 
+ *
  * Description: Task responsible for blinking the LED to indicate the system is alive
  * 				Also, it resets the watchdog timer to prevent the system from rebooting.
- * 
+ *
  * Parameters:
  *   - taskParams (not used)
- * 
+ *
  * Returns: void
  */
 static void aliveTask(__unused void *taskParams)
@@ -430,11 +535,6 @@ static void aliveTask(__unused void *taskParams)
 	/*                          Task Initialization Code                           */
 	/*******************************************************************************/
 	TickType_t xLastWakeTime;
-
-#if (ALIVE_LED_ENABLED == ON)
-	static bool state_LED;
-	static uint8_t consecutiveFailures = 0;
-#endif
 
 	/* Initialize xLastWakeTime - this only needs to be done once. */
 	xLastWakeTime = xTaskGetTickCount();
@@ -446,62 +546,15 @@ static void aliveTask(__unused void *taskParams)
 		vTaskDelayUntil(&xLastWakeTime, ALIVE_TASK_PERIOD_TICKS); /* Execute periodically at consistent intervals based on a reference time */
 
 #if (ALIVE_LED_ENABLED == ON)
-		state_LED = !state_LED; // Toggle the state of the LED
-		
-		/* Get the async context from the CYW43 driver. async_context is a data structure used for managing asynchronous operations 
-			in a thread-safe manner. It maintains an internal event queue where asynchronous events are posted and processed. 
-			In FreeRTOS where we use the pico_cyw43_arch_lwip_sys_freertos library, a dedicated task is used to process these events */
-		async_context_t *context = cyw43_arch_async_context();
-
-		/* Acquire the lock */
-		async_context_acquire_lock_blocking(context);
-
-		/* Time the ioctl itself. This is not instrumentation - it is the health
-		 * check: cyw43_ll_gpio_set() discards the ioctl's error and always
-		 * returns 0, so its duration is the only evidence we get that the wifi
-		 * chip stopped answering (see the failure handling below). */
-		uint64_t ioctlStartUs = time_us_64();
-
-		/* Set the state of the LED */
-		int ret = cyw43_gpio_set(&cyw43_state, CYW43_WL_GPIO_LED_PIN, state_LED);
-
-		uint32_t ioctlUs = (uint32_t)(time_us_64() - ioctlStartUs);
-
-		/* Release the lock */
-		async_context_release_lock(context);
-
-		/* Check if the LED was set successfully.
-		 *
-		 * 'ret' alone is NOT a sufficient health check: cyw43_ll_gpio_set()
-		 * (cyw43_ll.c) ends with a bare `return 0` and throws away the result of
-		 * the underlying cyw43_write_iovar_u32_u32() ioctl, so cyw43_gpio_set()
-		 * reports success even when the ioctl timed out. During the 2026-07-23
-		 * capture the wifi chip was completely unreachable for 15.6 hours and this
-		 * branch never fired once - the application was blind to a dead radio.
-		 *
-		 * So also treat a blink that took as long as the pico-sdk ioctl timeout
-		 * (CYW43_IOCTL_TIMEOUT_US, 1 s) as a failure. A healthy gpio_set is a few
-		 * ms; only a timed-out SDPCM exchange takes ~1005 ms, which makes the
-		 * duration a reliable proxy for the error the driver discarded. */
-		bool ledTimedOut = (ioctlUs >= CYW43_IOCTL_TIMEOUT_LIKELY_US);
-
-		if((ret != 0) || ledTimedOut)
+		/* Stay off the CYW43 chip while it is being power-cycled: the LED lives
+		 * on that chip, so blinking now would only block on the async_context
+		 * lock the recovery needs, or burn a 1 s ioctl timeout per iteration
+		 * against a radio that is deliberately powered down. Skipping the blink
+		 * still counts as a completed iteration, so the heartbeat below keeps
+		 * advancing and the watchdog supervisor stays satisfied. */
+		if(!WiFi_RadioRecoveryPending())
 		{
-			consecutiveFailures++;
-			LOG("LED failure number %d (ret=%d, gpio_set %lu us%s)\n",
-				consecutiveFailures, ret, (unsigned long)ioctlUs,
-				ledTimedOut ? ", ioctl TIMEOUT - wifi chip not responding" : "");
-
-			if(consecutiveFailures >= LED_FAILURES_BEFORE_ERROR)
-			{
-				/* The wifi chip is not answering at all. Enter the error state. */
-				CriticalErrorHandler(MODULE_ID_OS, ERROR_ID_LED_FAILED);
-			}
-		}
-		else
-		{
-			/* Reset the counter if the LED was set successfully */
-			consecutiveFailures = 0;
+			serviceAliveLed();
 		}
 #endif
 

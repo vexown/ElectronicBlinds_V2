@@ -59,6 +59,48 @@ bool connectToWifi(void);
 bool setupWifiAccessPoint(void);
 void WiFi_MainFunction(void);
 
+/*
+ * Radio recovery
+ * --------------
+ * The CYW43 wifi chip can wedge: it stops granting SDPCM bus credits and every
+ * ioctl then costs its full 1 s timeout, forever. Observed after a long run of
+ * failed joins against an AP that never completes the WPA handshake. Nothing in
+ * the driver recovers from it - the SDPCM stall loop's only nudge (a mailbox
+ * poke) is compiled out on SPI-attached parts like the Pico 2 W - so the chip
+ * has to be power-cycled. Historically only a board reset did that, by accident:
+ * cyw43_ensure_up() toggles WL_REG_ON during init.
+ *
+ * These three functions do it deliberately and without rebooting, so the blinds
+ * keep running through a radio outage.
+ */
+
+/**
+ * @brief Ask for the wifi chip to be power-cycled and rejoined.
+ *
+ * Called by whoever notices the radio has stopped answering (the alive task,
+ * whose LED lives on the chip). Only records the request - the actual recovery
+ * runs later from the network task. Safe to call repeatedly.
+ */
+void WiFi_RequestRadioRecovery(void);
+
+/**
+ * @brief True while a radio recovery is requested or in progress.
+ *
+ * Callers that talk to the CYW43 chip should stay off it while this is set:
+ * every access would otherwise block for the 1 s ioctl timeout and fight the
+ * recovery for the async_context lock.
+ */
+bool WiFi_RadioRecoveryPending(void);
+
+/**
+ * @brief Perform a pending radio recovery, if any. Called from the network task.
+ *
+ * Powers the chip down (cyw43_deinit), then rejoins - the reconnect path runs
+ * cyw43_ensure_up(), which drives WL_REG_ON low/high and re-downloads the chip
+ * firmware. Blocks for the duration; does nothing when no recovery is pending.
+ */
+void WiFi_ServiceRadioRecovery(void);
+
 /*******************************************************************************/
 /*                             GLOBAL VARIABLES                               */
 /*******************************************************************************/

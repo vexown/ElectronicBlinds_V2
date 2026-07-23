@@ -12,6 +12,7 @@
 
 /* Kernel includes. */
 #include "FreeRTOS.h"
+#include "task.h"
 
 /* SDK includes */
 #include "pico/stdlib.h"
@@ -29,7 +30,22 @@
 /*******************************************************************************/
 
 /* WiFi macros */
-#define WIFI_CONNECTION_TIMEOUT_MS 			(10000) //10s 
+#define WIFI_CONNECTION_TIMEOUT_MS 			(10000) //10s
+
+/* How long the chip is left unpowered between the deinit and the rejoin during a
+ * radio recovery. cyw43_ensure_up() already holds WL_REG_ON low for 20 ms of its
+ * own; this is extra margin for the regulator to fully discharge so the chip
+ * comes back from a genuine cold start rather than a marginal brown-out. */
+#define RADIO_RECOVERY_OFF_TIME_MS			(250)
+
+/*******************************************************************************/
+/*                            STATIC VARIABLES                                 */
+/*******************************************************************************/
+
+/* Set by WiFi_RequestRadioRecovery() from the alive task, consumed by
+ * WiFi_ServiceRadioRecovery() on the network task. Volatile because it crosses
+ * tasks with no lock; single writer per state so no race matters. */
+static volatile bool s_radioRecoveryPending = false;
 
 /*******************************************************************************/
 /*                         STATIC FUNCTION DECLARATIONS                          */
@@ -102,6 +118,68 @@ bool connectToWifi(void)
  * - always returns true for now
  * 
  */
+
+void WiFi_RequestRadioRecovery(void)
+{
+    if (!s_radioRecoveryPending)
+    {
+        LOG("Wi-Fi chip unresponsive - requesting radio power-cycle\n");
+        s_radioRecoveryPending = true;
+    }
+}
+
+bool WiFi_RadioRecoveryPending(void)
+{
+    return s_radioRecoveryPending;
+}
+
+void WiFi_ServiceRadioRecovery(void)
+{
+    if (!s_radioRecoveryPending)
+    {
+        return;
+    }
+
+    LOG("Recovering Wi-Fi chip: powering down...\n");
+
+    /* Power the chip off and reset all driver state. cyw43_deinit() removes the
+     * lwIP netifs, deinits the SPI bus and calls cyw43_init(), which drives
+     * WL_REG_ON low - so the radio is genuinely unpowered when this returns.
+     *
+     * Deliberately NOT cyw43_arch_deinit(): that also tears down the
+     * async_context worker task and the lwIP integration. We only need to
+     * recycle the driver and the chip, and keeping the surrounding machinery
+     * alive makes this far less disruptive to the rest of the system. */
+    cyw43_deinit(&cyw43_state);
+
+    vTaskDelay(pdMS_TO_TICKS(RADIO_RECOVERY_OFF_TIME_MS));
+
+    /* Rejoining runs cyw43_ensure_up() internally, which sees the driver marked
+     * down, drives WL_REG_ON low->high and re-downloads the chip firmware and
+     * CLM blob. That firmware download is why this must go through the driver
+     * rather than toggling the pin ourselves - a power-cycled chip comes back
+     * with no firmware at all. */
+    LOG("Recovering Wi-Fi chip: powering up and rejoining...\n");
+    bool reconnected = connectToWifi();
+
+    /* Rebuild the TCP/UDP endpoints either way: the sockets referred to netifs
+     * that cyw43_deinit() has removed. If the rejoin failed, the INIT state
+     * simply keeps retrying, which is what it already does on a lost link. */
+    WiFiState = INIT;
+
+    s_radioRecoveryPending = false;
+
+    if (reconnected)
+    {
+        LOG("Wi-Fi chip recovered and rejoined.\n");
+    }
+    else
+    {
+        /* The chip is alive again even though the network is not - the alive LED
+         * will start working, and the normal retry path takes over from here. */
+        LOG("Wi-Fi chip power-cycled but rejoin failed - normal retry continues.\n");
+    }
+}
 
 bool setupWifiAccessPoint(void)
 {
