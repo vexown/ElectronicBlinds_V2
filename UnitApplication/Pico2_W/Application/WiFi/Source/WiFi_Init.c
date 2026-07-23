@@ -76,7 +76,7 @@ bool connectToWifi(void)
     /* Enables Wi-Fi in Station (STA) mode such that connections can be made to other Wi-Fi Access Points */
     cyw43_arch_enable_sta_mode();
 
-    /* Attempt to connect to a wireless access point (currently my Tenda WiFi router)
+    /* Attempt to connect to a wireless access point (currently an ASUS RT-AX57)
        Blocking until the network is joined, a failure is detected or a timeout occurs */
     LOG("Connecting to Wi-Fi...\n");
     if (cyw43_arch_wifi_connect_timeout_ms(ssid, pass, CYW43_AUTH_WPA2_AES_PSK, WIFI_CONNECTION_TIMEOUT_MS)) 
