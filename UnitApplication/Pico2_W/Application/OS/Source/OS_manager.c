@@ -387,6 +387,46 @@ static void monitorTask(__unused void *taskParams)
  * 
  * Returns: void
  */
+#if (PICO_AS_ACCESS_POINT == OFF)
+/*
+ * Function: wifiRetryWait
+ *
+ * Description: Waits out a Wi-Fi retry backoff, but stays responsive to a radio
+ * recovery request instead of sleeping through it.
+ *
+ * The backoff climbs to 15 minutes, and the wifi chip is most likely to wedge
+ * while a connect loop is retrying - so a plain vTaskDelay() here would leave a
+ * dead radio unrecovered for up to a quarter of an hour. Waiting in short slices
+ * bounds that to about one second.
+ *
+ * Parameters:
+ *   - delay: total time to wait, in ticks
+ *
+ * Returns: true if a radio recovery was performed (the caller should retry the
+ *          join straight away), false if the full delay simply elapsed.
+ */
+static bool wifiRetryWait(TickType_t delay)
+{
+	const TickType_t slice  = pdMS_TO_TICKS(1000);
+	TickType_t       waited = 0;
+
+	while (waited < delay)
+	{
+		TickType_t chunk = ((delay - waited) < slice) ? (delay - waited) : slice;
+		vTaskDelay(chunk);
+		waited += chunk;
+
+		if (WiFi_RadioRecoveryPending())
+		{
+			WiFi_ServiceRadioRecovery();
+			return true;
+		}
+	}
+
+	return false;
+}
+#endif /* PICO_AS_ACCESS_POINT == OFF */
+
 static void networkTask(__unused void *taskParams)
 {
 	/*******************************************************************************/
@@ -406,7 +446,18 @@ static void networkTask(__unused void *taskParams)
 	{
 		LOG("Wi-Fi connect failed, retrying in %lus...\n",
 			(unsigned long)(pdTICKS_TO_MS(retryDelay) / 1000U));
-		vTaskDelay(retryDelay);
+
+		/* Interruptible wait: services a radio recovery as soon as one is
+		 * requested and then retries the join immediately with a working chip.
+		 * The backoff is deliberately NOT reset here - if the access point is
+		 * still broken and the chip keeps wedging, resetting would put us in a
+		 * 30-second recover-join-wedge cycle, power-cycling the radio each time.
+		 * Skipping the doubling is enough: the retry cadence holds steady rather
+		 * than either escalating or collapsing. */
+		if (wifiRetryWait(retryDelay))
+		{
+			continue;
+		}
 
 		retryDelay *= 2;
 		if (retryDelay > WIFI_RETRY_DELAY_MAX_TICKS)

@@ -144,7 +144,8 @@ void WiFi_ServiceRadioRecovery(void)
 
     /* Power the chip off and reset all driver state. cyw43_deinit() removes the
      * lwIP netifs, deinits the SPI bus and calls cyw43_init(), which drives
-     * WL_REG_ON low - so the radio is genuinely unpowered when this returns.
+     * WL_REG_ON low - so the radio is genuinely unpowered when this returns -
+     * and clears itf_state, so the bring-up below takes the full path.
      *
      * Deliberately NOT cyw43_arch_deinit(): that also tears down the
      * async_context worker task and the lwIP integration. We only need to
@@ -154,31 +155,29 @@ void WiFi_ServiceRadioRecovery(void)
 
     vTaskDelay(pdMS_TO_TICKS(RADIO_RECOVERY_OFF_TIME_MS));
 
-    /* Rejoining runs cyw43_ensure_up() internally, which sees the driver marked
-     * down, drives WL_REG_ON low->high and re-downloads the chip firmware and
-     * CLM blob. That firmware download is why this must go through the driver
-     * rather than toggling the pin ourselves - a power-cycled chip comes back
-     * with no firmware at all. */
-    LOG("Recovering Wi-Fi chip: powering up and rejoining...\n");
-    bool reconnected = connectToWifi();
+    /* Bring the chip back up, but do NOT join here. cyw43_arch_enable_sta_mode()
+     * reaches cyw43_wifi_on() -> cyw43_ensure_up(), which drives WL_REG_ON
+     * low->high and re-downloads the chip firmware and CLM blob. That firmware
+     * download is why this goes through the driver rather than toggling the pin
+     * ourselves - a power-cycled chip comes back with no firmware at all.
+     *
+     * Joining is deliberately left to whoever was already trying to connect.
+     * This function used to call connectToWifi() itself, which meant it could
+     * only be run from a caller that was not already in a connect loop - and the
+     * most likely moment for the radio to wedge is precisely while a connect
+     * loop is retrying. Restoring the hardware and letting the existing retry
+     * logic do the joining keeps the two concerns separate. */
+    LOG("Recovering Wi-Fi chip: powering back up...\n");
+    cyw43_arch_enable_sta_mode();
 
-    /* Rebuild the TCP/UDP endpoints either way: the sockets referred to netifs
-     * that cyw43_deinit() has removed. If the rejoin failed, the INIT state
-     * simply keeps retrying, which is what it already does on a lost link. */
+    /* Rebuild the TCP/UDP endpoints: their sockets referred to netifs that
+     * cyw43_deinit() removed. Harmless if we are not connected yet - INIT simply
+     * keeps retrying, which is what it already does on a lost link. */
     WiFiState = INIT;
 
     s_radioRecoveryPending = false;
 
-    if (reconnected)
-    {
-        LOG("Wi-Fi chip recovered and rejoined.\n");
-    }
-    else
-    {
-        /* The chip is alive again even though the network is not - the alive LED
-         * will start working, and the normal retry path takes over from here. */
-        LOG("Wi-Fi chip power-cycled but rejoin failed - normal retry continues.\n");
-    }
+    LOG("Wi-Fi chip powered back up - normal connect logic resumes.\n");
 }
 
 bool setupWifiAccessPoint(void)
