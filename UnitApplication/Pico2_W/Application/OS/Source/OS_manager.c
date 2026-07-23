@@ -431,6 +431,9 @@ static void aliveTask(__unused void *taskParams)
 #if (ALIVE_LED_ENABLED == ON)
 	static bool state_LED;
 	static uint8_t consecutiveFailures = 0;
+	/* DEBUG (stall hunt): latched once the LED/ioctl path is declared dead, so the
+	 * heartbeat is withheld and the "declared dead" line is logged only once. */
+	static bool ledDeclaredDead = false;
 #endif
 
 	/* Initialize xLastWakeTime - this only needs to be done once. */
@@ -543,14 +546,38 @@ static void aliveTask(__unused void *taskParams)
 
 			if(consecutiveFailures >= 3)
 			{
-				/* If the LED fails to set 3 times in a row, enter error state */
-				CriticalErrorHandler(MODULE_ID_OS, ERROR_ID_LED_FAILED);
+				/* DEBUG (stall hunt): deliberately do NOT call
+				 * CriticalErrorHandler() here. That parks via
+				 * CriticalErrorPark(.., NULL), which prints a bare
+				 * "PARKED moduleId/errorId" line with no task table and no CYW43
+				 * bus probe - strictly less than the watchdog supervisor's freeze
+				 * dump. And it would win the race: three consecutive ~1005 ms ioctl
+				 * timeouts take ~3 s, inside the supervisor's 4 s stall deadline,
+				 * so parking here would destroy exactly the evidence we are trying
+				 * to collect.
+				 *
+				 * Instead simply stop claiming to be alive (below). That is also
+				 * the honest signal - the blink genuinely is not completing - and
+				 * it routes the failure into the single existing diagnostic path:
+				 * the supervisor notices the stale heartbeat within 4 s and runs
+				 * the full dump, CYW43 probe included, then freezes.
+				 *
+				 * Restore the CriticalErrorHandler() call when the DEBUG stall-hunt
+				 * commits are reverted. */
+				if(!ledDeclaredDead)
+				{
+					ledDeclaredDead = true;
+					LOG("[DEBUG] LED failed %d times in a row - wifi chip unreachable. "
+						"Withholding heartbeat so the supervisor dumps and freezes.\n",
+						consecutiveFailures);
+				}
 			}
 		}
 		else
 		{
 			/* Reset the counter if the LED was set successfully */
 			consecutiveFailures = 0;
+			ledDeclaredDead = false;
 		}
 #endif
 
@@ -560,8 +587,18 @@ static void aliveTask(__unused void *taskParams)
 		 * heartbeat only advances on a fully completed iteration. If aliveTask
 		 * blocks inside the loop or is starved of CPU, the heartbeat goes stale and
 		 * the supervisor catches it. The watchdog pet itself now lives in the
-		 * supervisor, decoupled from this lowest-priority task and from WiFi. */
-		WatchdogSupervisor_ReportAlive();
+		 * supervisor, decoupled from this lowest-priority task and from WiFi.
+		 *
+		 * DEBUG (stall hunt): withheld once the LED path is declared dead. A blink
+		 * that only "completes" by burning the CYW43 ioctl timeout is not a healthy
+		 * iteration, and reporting it as one is what let the board sit with a dead
+		 * radio while the supervisor saw a perfectly steady ~1 s heartbeat. */
+#if (ALIVE_LED_ENABLED == ON)
+		if(!ledDeclaredDead)
+#endif
+		{
+			WatchdogSupervisor_ReportAlive();
+		}
 #endif
 
 	}
