@@ -235,22 +235,17 @@ __attribute__((noreturn)) void FaultHandler_RecordMallocFailed(void);
  *   - scratch[2] = eTaskState of the stalled task at detection (the key
  *                  discriminator: Blocked = stuck on a resource such as the
  *                  CYW43 lock; Ready = starved of CPU by a higher-priority task)
- *   - scratch[3] = first 4 chars of the CYW43 lock holder's name, packed as
- *                  ASCII (the prime suspect when the monitored task is Blocked,
- *                  since its only indefinite block is acquiring that lock)
  *
  * The monitored task is always the alive canary, so its (known) name is not
- * stored; the scarce scratch slot carries the lock holder instead - the useful
- * unknown. This recorder intentionally does not print or reboot: the supervisor
- * prints a full live dump itself, then stops petting so the hardware watchdog
- * resets the board. The breadcrumb only exists so FaultHandler_ReportLastCrash()
- * can also announce the cause on the next boot if nobody was watching the UART.
+ * stored. This recorder intentionally does not print or reboot: the supervisor
+ * stops petting so the hardware watchdog resets the board. The breadcrumb only
+ * exists so FaultHandler_ReportLastCrash() can announce the cause on the next
+ * boot if nobody was watching the UART. For the full task table and a CYW43 bus
+ * probe at the moment of the stall, build with -DWATCHDOG_STALL_DIAGNOSTICS=ON.
  *
  * @param task_state  eTaskState value (cast to uint32_t) of the stalled task.
- * @param lock_holder Name of the task holding the CYW43 lock at detection
- *                    (e.g. "(unheld)" if nobody holds it); NULL is tolerated.
  */
-void FaultHandler_RecordWatchdogStall(uint32_t task_state, const char *lock_holder);
+void FaultHandler_RecordWatchdogStall(uint32_t task_state);
 
 /**
  * @brief Record that the reboot about to happen is intentional (a clean reboot).
@@ -289,72 +284,5 @@ FaultHandler_ResetClass FaultHandler_GetLastResetClass(void);
  * Otherwise returns "". The buffer is statically owned - do not free it.
  */
 const char *FaultHandler_GetLastCause(void);
-
-/*
- * ----------------------------------------------------------------------------
- * Persistent stall dump (DEBUG diagnostic aid)
- * ----------------------------------------------------------------------------
- * The scratch registers hold 3 words - enough for a breadcrumb, not for the
- * full task-table dump the watchdog supervisor prints at the moment of a stall.
- * That dump (per-task state/priority/stack/CPU-share over the stall window) is
- * the thing that actually names a CPU hog, and it is useless on UART if nobody
- * is attached when the stall happens.
- *
- * These functions mirror the dump into a checksummed buffer placed in
- * .uninitialized_data: crt0 neither loads nor zeroes that section, and SRAM
- * contents survive a watchdog/soft reset (they are lost only on a true power
- * cycle). After the reset, the boot-time park loop replays the saved dump
- * periodically, so a terminal attached at ANY later time sees the complete
- * system state from the moment of failure.
- *
- * Validity is guarded by magic + FNV-1a checksum: if the bootloader or a power
- * glitch clobbers the region, FaultHandler_GetSavedStallDump() simply returns
- * NULL instead of garbage.
- */
-
-/**
- * @brief Start capturing a new stall dump (invalidates any previous one).
- */
-void FaultHandler_StallDumpBegin(void);
-
-/**
- * @brief Append one formatted line to the persistent stall-dump buffer.
- *
- * Buffer-ONLY: this does not print anywhere live, on purpose. It is lock-free
- * and bounded so the whole dump can be built and sealed before any blocking
- * I/O. A stall usually means a task is wedged holding the stdio print mutex, so
- * printing from here (as an earlier version did) deadlocks the supervisor and
- * nothing survives the reset. Live output is StallDumpEcho()'s job, after the
- * seal. Silently truncates once the buffer is full. Only meaningful between
- * StallDumpBegin() and StallDumpCommit().
- */
-__attribute__((format(printf, 1, 2)))
-void FaultHandler_StallDumpPrintf(const char *fmt, ...);
-
-/**
- * @brief Seal the captured dump (checksum + magic) so it can be recognised as
- *        valid after the upcoming watchdog reset.
- */
-void FaultHandler_StallDumpCommit(void);
-
-/**
- * @brief Best-effort LIVE echo of the sealed dump to the raw UART.
- *
- * Call AFTER StallDumpCommit(). Emits the buffer via lock-free raw UART writes
- * (never printf), so it reaches a terminal recording the port even when the
- * stdio mutex is held by whatever wedged the system. No-op if no dump is
- * sealed. This is the deadlock-proof capture path; the reset-surviving RAM
- * copy replayed by the next boot's park loop is the fallback for when nobody
- * was recording.
- */
-void FaultHandler_StallDumpEcho(void);
-
-/**
- * @brief Retrieve the stall dump saved by the PREVIOUS boot.
- *
- * @return NUL-terminated dump text, or NULL if none survived (fresh power-on,
- *         clobbered RAM, or no stall was ever recorded). Statically owned.
- */
-const char *FaultHandler_GetSavedStallDump(void);
 
 #endif /* FAULT_HANDLER_H */

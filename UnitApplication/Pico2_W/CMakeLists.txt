@@ -40,6 +40,26 @@ else()
     message(FATAL_ERROR "Please define either DEBUG_BUILD or RELEASE_BUILD.")
 endif()
 
+# Opt-in diagnostic build for hunting watchdog stalls.
+#
+# OFF (normal): a stall resets the board, which is the production policy - the
+# board must recover on its own.
+#
+# ON: the supervisor never stops petting the watchdog. It dumps the full task
+# table, heap and a CYW43 bus probe over the raw UART and then holds the board
+# in the stalled state, re-dumping every ~5 s forever. Nothing has to survive a
+# reset and nobody has to be recording at the moment of failure - the evidence
+# waits until a UART adapter is attached, minutes or hours later.
+#
+# Enable with: cmake -DWATCHDOG_STALL_DIAGNOSTICS=ON ..
+# The board will NOT self-recover while this is on; power-cycle to clear.
+option(WATCHDOG_STALL_DIAGNOSTICS "Freeze and dump on watchdog stall instead of resetting" OFF)
+
+if(WATCHDOG_STALL_DIAGNOSTICS)
+    add_compile_definitions(WATCHDOG_STALL_DIAGNOSTICS)
+    message(WARNING "WATCHDOG_STALL_DIAGNOSTICS is ON - the board will FREEZE on a watchdog stall instead of resetting. Diagnostic builds only.")
+endif()
+
 # Specify parameters for pico-sdk
 set(PICO_BOARD pico2_w)
 set(PICO_PLATFORM rp2350)

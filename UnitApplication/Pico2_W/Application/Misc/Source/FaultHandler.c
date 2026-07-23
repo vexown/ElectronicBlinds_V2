@@ -80,23 +80,6 @@ extern TaskHandle_t volatile pxCurrentTCB;
 static FaultHandler_ResetClass s_lastResetClass = LAST_RESET_NONE;
 static char                    s_lastCause[96]  = {0};
 
-/* DEBUG: persistent stall dump (see FaultHandler.h). Lives in
- * .uninitialized_data: crt0 neither loads nor zeroes it, and SRAM survives a
- * watchdog reset, so the dump written moments before the reset is still here
- * on the next boot. Magic + checksum guard against a clobbered/decayed region
- * (bootloader RAM usage, true power cycle). */
-#define STALL_DUMP_MAGIC 0x5D0D57A1U
-
-typedef struct
-{
-    uint32_t magic; /* STALL_DUMP_MAGIC when a sealed dump is present */
-    uint32_t len;   /* bytes of text[] actually used */
-    uint32_t crc;   /* FNV-1a over text[0..len) */
-    char     text[3072];
-} StallDumpBuffer;
-
-static StallDumpBuffer __uninitialized_ram(s_stallDump);
-
 /*******************************************************************************/
 /*                       STATIC FUNCTION DECLARATIONS                          */
 /*******************************************************************************/
@@ -624,37 +607,20 @@ void FaultHandler_ReportLastCrash(void)
 
         case FAULT_TYPE_WD_STALL:
         {
-            /* data1 = eTaskState of the stalled (alive canary) task at detection;
-             * data2 = first 4 chars of the CYW43 lock holder's name, packed as
-             * little-endian ASCII. The state is the key discriminator: a BLOCKED
-             * canary was stuck waiting on a resource - and its only indefinite
-             * block is the CYW43 lock, so the holder named below is the suspect.
-             * A READY canary was instead starved of CPU by a higher-priority hog
-             * (in which case the holder is not relevant - see the live dump). */
+            /* data1 = eTaskState of the stalled (alive canary) task at detection.
+             * That state is the key discriminator: a BLOCKED canary was stuck
+             * waiting on a resource (its only indefinite block is the CYW43 lock),
+             * whereas a READY canary was starved of CPU by a higher-priority task.
+             * Build with -DWATCHDOG_STALL_DIAGNOSTICS=ON for the full task table
+             * and CYW43 bus probe instead of this one-line summary. */
             static const char *const stateNames[] =
                 { "Running", "Ready", "Blocked", "Suspended", "Deleted", "Invalid" };
-            char holder[5] = {0};
-            for (int i = 0; i < 4; i++)
-            {
-                holder[i] = (char)((data2 >> (i * 8)) & 0xFFU);
-            }
             const char *state = (data1 < (sizeof(stateNames) / sizeof(stateNames[0])))
                        ? stateNames[data1] : "?";
             printf("Type: Watchdog stall (monitored task heartbeat stopped)\n");
             printf("Monitored task state at stall: %s\n", state);
-            printf("CYW43 lock holder at stall: '%s'\n", holder);
-            if (data1 == (uint32_t)eBlocked)
-            {
-                snprintf(s_lastCause, sizeof(s_lastCause),
-                         "Watchdog stall: canary Blocked on CYW43 lock held by '%s'",
-                         holder);
-            }
-            else
-            {
-                snprintf(s_lastCause, sizeof(s_lastCause),
-                         "Watchdog stall: canary was %s (CYW43 lock holder '%s')",
-                         state, holder);
-            }
+            snprintf(s_lastCause, sizeof(s_lastCause),
+                     "Watchdog stall: monitored task was %s", state);
             break;
         }
 
@@ -725,120 +691,16 @@ __attribute__((noreturn)) void FaultHandler_RecordMallocFailed(void)
     reboot_now();
 }
 
-void FaultHandler_RecordWatchdogStall(uint32_t task_state, const char *lock_holder)
+void FaultHandler_RecordWatchdogStall(uint32_t task_state)
 {
     /* Unlike the other recorders this one does NOT reboot. The watchdog
-     * supervisor calls it after it has already printed a full live diagnostic
-     * dump, and then deliberately stops petting the watchdog so the hardware
-     * performs the reset. We only leave the compact breadcrumb in scratch[1..3]
-     * so that FaultHandler_ReportLastCrash() can announce the cause on the next
-     * boot too - useful if nobody was watching the UART when the stall hit.
-     * scratch[3] carries the CYW43 lock holder (the suspect), not the (always
-     * "alive canary") stalled task name. */
+     * supervisor calls it and then deliberately stops petting the watchdog so the
+     * hardware performs the reset. We only leave the compact breadcrumb in
+     * scratch[1..2] so FaultHandler_ReportLastCrash() can announce the cause on
+     * the next boot - useful when nobody was watching the UART at the time. */
     watchdog_hw->scratch[1] = FAULT_TAG(FAULT_TYPE_WD_STALL);
     watchdog_hw->scratch[2] = task_state;
-    watchdog_hw->scratch[3] = pack_first4(lock_holder);
-}
-
-/* DEBUG: persistent stall dump - see the block comment in FaultHandler.h. */
-
-/**
- * @brief FNV-1a over an explicit byte range (the string variant fnv1a32()
- *        stops at NUL; the dump length is tracked separately).
- */
-static uint32_t fnv1a32_buf(const char *buf, uint32_t len)
-{
-    uint32_t hash = 0x811C9DC5U;
-    for (uint32_t i = 0; i < len; i++)
-    {
-        hash ^= (uint8_t)buf[i];
-        hash *= 0x01000193U;
-    }
-    return hash;
-}
-
-void FaultHandler_StallDumpBegin(void)
-{
-    s_stallDump.magic = 0; /* invalidate while the new dump is being written */
-    s_stallDump.len   = 0;
-    s_stallDump.crc   = 0;
-}
-
-void FaultHandler_StallDumpPrintf(const char *fmt, ...)
-{
-    /* Buffer-only, lock-free and bounded. Deliberately does NOT touch stdio.
-     *
-     * The whole dump must be built and sealed (StallDumpCommit) BEFORE any
-     * blocking I/O, because a stall frequently means some task is wedged while
-     * holding the pico-sdk stdio print mutex (the network task, for instance,
-     * logs constantly and is a prime candidate to be stuck mid-printf). A
-     * vprintf() here would then block the supervisor on that very mutex, the
-     * dump would never be committed, and nothing would survive the reset - which
-     * is exactly the "no stall dump survived" failure seen on 2026-07-21.
-     * Live output is done separately and lock-free by StallDumpEcho(), AFTER
-     * the buffer is sealed. */
-    if (s_stallDump.len >= (uint32_t)sizeof(s_stallDump.text) - 1U)
-    {
-        return; /* buffer full - silently truncate */
-    }
-
-    va_list args;
-    va_start(args, fmt);
-
-    uint32_t space   = (uint32_t)sizeof(s_stallDump.text) - s_stallDump.len;
-    int      written = vsnprintf(&s_stallDump.text[s_stallDump.len], (size_t)space, fmt, args);
-    va_end(args);
-
-    if (written > 0)
-    {
-        uint32_t addedLen = (uint32_t)written;
-        /* vsnprintf reports what it WOULD have written; clamp on truncation */
-        s_stallDump.len += (addedLen < space) ? addedLen : (space - 1U);
-    }
-}
-
-void FaultHandler_StallDumpCommit(void)
-{
-    s_stallDump.crc   = fnv1a32_buf(s_stallDump.text, s_stallDump.len);
-    s_stallDump.magic = STALL_DUMP_MAGIC;
-}
-
-void FaultHandler_StallDumpEcho(void)
-{
-    /* Best-effort LIVE echo of the just-sealed dump, for the (now common) case
-     * where a terminal is recording the UART at stall time. Uses the raw,
-     * lock-free UART path - NOT printf - for the same reason StallDumpPrintf
-     * avoids stdio: whatever wedged the system may be holding the stdio mutex,
-     * so a printf here could deadlock. Raw register writes cannot. stdio on this
-     * board is UART (USB disabled), so this reaches the exact port being
-     * recorded. If nobody is listening it is harmless; the sealed RAM copy is
-     * what the next boot replays regardless. Must run AFTER StallDumpCommit(). */
-    if (s_stallDump.magic != STALL_DUMP_MAGIC)
-    {
-        return;
-    }
-    for (uint32_t i = 0; i < s_stallDump.len; i++)
-    {
-        uart_putc_raw(uart_default, s_stallDump.text[i]);
-    }
-}
-
-const char *FaultHandler_GetSavedStallDump(void)
-{
-    if (s_stallDump.magic != STALL_DUMP_MAGIC)
-    {
-        return NULL;
-    }
-    if ((s_stallDump.len == 0U) || (s_stallDump.len >= (uint32_t)sizeof(s_stallDump.text)))
-    {
-        return NULL;
-    }
-    if (fnv1a32_buf(s_stallDump.text, s_stallDump.len) != s_stallDump.crc)
-    {
-        return NULL;
-    }
-    s_stallDump.text[s_stallDump.len] = '\0';
-    return s_stallDump.text;
+    watchdog_hw->scratch[3] = 0;
 }
 
 /**

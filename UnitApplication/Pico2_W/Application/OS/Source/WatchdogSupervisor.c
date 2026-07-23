@@ -15,30 +15,43 @@
 /* Kernel includes. */
 #include "FreeRTOS.h"
 #include "task.h"
-#include "semphr.h"              /* xSemaphoreGetMutexHolder (DEBUG: CYW43 lock holder) */
 
 /* SDK includes */
 #include "pico/stdlib.h"
 #include "hardware/watchdog.h"
 #include "hardware/regs/watchdog.h"
 #include "hardware/structs/watchdog.h"
-#include "pico/cyw43_arch.h"           /* DEBUG: cyw43_arch_async_context() */
-#include "pico/async_context_freertos.h" /* DEBUG: async_context_freertos_t.lock_mutex */
 
 /* OS includes */
 #include "OS_manager.h"          /* MAX_NUM_OF_TASKS */
 #include "WatchdogSupervisor.h"
 
-/* Driver includes */
-#include "h_bridge_controller.h" /* HBridge_Stop - motors off before freezing forever */
-
 /* Misc includes */
 #include "Common.h"              /* LOG, CriticalErrorHandler, module/error IDs, NON_BLOCKING */
 #include "FaultHandler.h"        /* FaultHandler_RecordWatchdogStall */
 
+#if defined(WATCHDOG_STALL_DIAGNOSTICS)
+/* Diagnostic build only - see WATCHDOG_STALL_DIAGNOSTICS in the top CMakeLists. */
+#include <stdarg.h>
+#include "hardware/uart.h"       /* uart_putc_raw - lock-free dump output */
+#include "pico/cyw43_arch.h"     /* cyw43_state, cyw43_ll_has_work, host wake pin */
+#include "h_bridge_controller.h" /* HBridge_Stop - motors off before freezing forever */
+#endif
+
 /*******************************************************************************/
 /*                                  MACROS                                     */
 /*******************************************************************************/
+
+/* Boot-loop limit: this many watchdog resets that never reach healthy uptime
+ * trips CriticalErrorHandler instead of resetting forever. */
+#define MAX_WATCHDOG_RESETS 		3
+
+/* Once the board has run this long without a stall, the boot-loop counter
+ * (scratch[0]) is cleared so isolated transient resets spread across days of
+ * uptime can never accumulate to MAX_WATCHDOG_RESETS and brick the board. The
+ * 3-strike rule then only trips on a true boot loop (resets that never reach
+ * healthy uptime). */
+#define HEALTHY_UPTIME_MS 			((uint32_t)60000)
 
 /* Hardware watchdog timeout. Maximum ~8.3 s on RP2350. */
 #define WATCHDOG_TIMEOUT_MS 		((uint32_t)2000)
@@ -57,24 +70,14 @@
  * wifi-chip ioctl on 2026-07). */
 #define ALIVE_STALL_DEADLINE_MS 	((uint32_t)4000)
 
-/* DEBUG (stall hunt): when a stall is detected, FREEZE instead of resetting -
- * keep petting the watchdog forever and re-dump the live system state every
- * FREEZE_REDUMP_TICKS supervisor ticks.
- *
- * Rationale: every reset-based capture path we tried loses the evidence. The
- * dump has to survive a watchdog reset in RAM the bootloader may reuse, and a
- * terminal has to be recording at the exact moment of the reset. Staying alive
- * removes both problems - the stalled state simply sits there, reprinting, until
- * someone plugs in a UART adapter, whether that is 10 seconds or 10 hours later.
- *
- * This is safe because the supervisor runs at configMAX_PRIORITIES-2 (only the
- * timer task is above it) and, by definition, it is running - it just detected
- * the stall - so it can keep the hardware watchdog fed. Motors are stopped on
- * entry, because "never reset" means nothing else will stop them.
- *
- * Revert together with the other stall-hunt DEBUG commits once the root cause is
- * found; the production policy is reset-and-continue. */
+#if defined(WATCHDOG_STALL_DIAGNOSTICS)
+/* How often the frozen board re-dumps its state, in supervisor ticks. */
 #define FREEZE_REDUMP_TICKS 		((uint32_t)20)   /* 20 * 250 ms = ~5 s */
+
+/* Longest single line the lock-free dump can emit (task rows are ~80 chars, the
+ * CYW43 probe lines ~130). Longer lines are truncated, never overflowed. */
+#define DIAG_LINE_MAX 				((size_t)256)
+#endif
 
 /*******************************************************************************/
 /*                             STATIC VARIABLES                                */
@@ -96,8 +99,11 @@ static TaskHandle_t s_supervisorTaskHandle = NULL;
 /* Per-run supervisor state (were loop locals before this became a MainFunction). */
 static uint32_t   s_lastSeenHeartbeat = 0;
 static TickType_t s_lastProgressTick  = 0;
+static TickType_t s_bootTick          = 0;
+static bool       s_decayCleared      = false;
 static bool       s_stalled           = false;
 
+#if defined(WATCHDOG_STALL_DIAGNOSTICS)
 /* Snapshots for the stall dump. Kept at file scope (not on the supervisor's
  * stack) because each TaskStatus_t array is MAX_NUM_OF_TASKS entries. 'prev' is
  * refreshed every healthy supervisor cycle so that, at stall time, comparing
@@ -108,55 +114,66 @@ static TaskStatus_t snapPrev[MAX_NUM_OF_TASKS];
 static UBaseType_t  snapPrevCount = 0;
 static configRUN_TIME_COUNTER_TYPE prevTotalRunTime = 0;
 
-/* DEBUG (stall hunt): how many stall dumps have been emitted this power cycle.
- * >1 means the freeze park is reprinting. */
+/* How many stall dumps have been emitted this power cycle. >1 means the freeze
+ * loop is reprinting; comparing consecutive dumps shows whether the wedge is
+ * static or the system is still churning. */
 static uint32_t s_dumpCount = 0;
+#endif
 
 /*******************************************************************************/
 /*                       STATIC FUNCTION DECLARATIONS                          */
 /*******************************************************************************/
 
+#if defined(WATCHDOG_STALL_DIAGNOSTICS)
+static void diagPrintf(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 static void dumpSystemStateOnStall(uint32_t stalledForMs);
 static void dumpCyw43Probe(void);
 static void freezeForInspection(void);
-static void printSavedStallDump(void);
-static const char *cyw43LockHolderName(void);
+#endif
 
 /*******************************************************************************/
 /*                          STATIC FUNCTION DEFINITIONS                        */
 /*******************************************************************************/
 
+#if defined(WATCHDOG_STALL_DIAGNOSTICS)
 /*
- * Function: cyw43LockHolderName
+ * Function: diagPrintf
  *
- * Description: DEBUG helper. Names the task currently holding the CYW43
- * async_context lock - the alive canary's only indefinite block is acquiring
- * this lock (async_context_acquire_lock_blocking in aliveTask), so when the
- * canary is found Blocked, whoever holds this lock is the prime suspect.
+ * Description: Emits one formatted line straight to the UART, taking no locks.
  *
- * cyw43_arch_async_context() returns the async_context_t base, which is the
- * first member of the async_context_freertos_t actually in use (the project
- * builds with pico_cyw43_arch_lwip_sys_freertos), so we can recover the
- * SemaphoreHandle_t lock_mutex and ask FreeRTOS who owns it.
+ * Deliberately not printf(). A stall frequently means some task is wedged while
+ * holding the pico-sdk stdio print mutex - the network task logs constantly and
+ * is a prime candidate to be stuck mid-print. printf() here would block the
+ * supervisor on that very mutex and the dump would never appear. vsnprintf()
+ * only formats into a local buffer and uart_putc_raw() is a bare register write,
+ * so neither can block. stdio on this board is UART with USB disabled, so this
+ * reaches the same port a terminal is attached to.
  *
- * Returns: task name of the holder, or "(unheld)"/"(n/a)" - never NULL.
+ * Parameters:
+ *   - fmt, ...: printf-style format and arguments
+ *
+ * Returns: void
  */
-static const char *cyw43LockHolderName(void)
+static void diagPrintf(const char *fmt, ...)
 {
-	async_context_t *ctx = cyw43_arch_async_context();
-	if (ctx == NULL)
+	char    line[DIAG_LINE_MAX];
+	va_list args;
+
+	va_start(args, fmt);
+	int written = vsnprintf(line, sizeof(line), fmt, args);
+	va_end(args);
+
+	if (written <= 0)
 	{
-		return "(n/a)";
+		return;
 	}
 
-	SemaphoreHandle_t lock = ((async_context_freertos_t *)ctx)->lock_mutex;
-	if (lock == NULL)
+	/* vsnprintf returns what it WOULD have written; clamp on truncation. */
+	size_t len = ((size_t)written < sizeof(line)) ? (size_t)written : (sizeof(line) - 1U);
+	for (size_t i = 0; i < len; i++)
 	{
-		return "(n/a)";
+		uart_putc_raw(uart_default, line[i]);
 	}
-
-	TaskHandle_t holder = xSemaphoreGetMutexHolder(lock);
-	return (holder != NULL) ? pcTaskGetName(holder) : "(unheld)";
 }
 
 /*
@@ -176,10 +193,7 @@ static const char *cyw43LockHolderName(void)
  *   - no hog and even this (highest-priority) task barely running -> a
  *     scheduler-level block (long critical section / IRQs off / ISR storm).
  *
- * The dump is built into a reset-surviving buffer (lock-free, no stdio) and
- * sealed, THEN echoed live to the raw UART. Neither step touches the stdio
- * print mutex, so it cannot deadlock against a task that wedged mid-printf -
- * which is precisely the situation a stall on the CYW43/network path creates.
+ * Output goes through diagPrintf(), which takes no locks - see the note there.
  *
  * Parameters:
  *   - stalledForMs: how long the heartbeat had been stale at detection
@@ -202,26 +216,19 @@ static void dumpSystemStateOnStall(uint32_t stalledForMs)
 		totalWindow = 1; /* guard against divide-by-zero on the very first window */
 	}
 
-	/* DEBUG: every line below is teed into a reset-surviving RAM buffer so the
-	 * boot-time park can replay this dump to a terminal attached AFTER the fact. */
-	FaultHandler_StallDumpBegin();
-
-	/* Numbered so repeats are distinguishable while frozen: comparing consecutive
-	 * dumps shows whether the wedge is static (same holder, no CPU moving) or the
-	 * system is churning. */
 	s_dumpCount++;
 
-	FaultHandler_StallDumpPrintf("\n===== WATCHDOG SUPERVISOR: STALL DETECTED (dump #%lu) =====\n",
+	diagPrintf("\n===== WATCHDOG SUPERVISOR: STALL DETECTED (dump #%lu) =====\n",
 		   (unsigned long)s_dumpCount);
-	FaultHandler_StallDumpPrintf("Uptime: %lu ms\n",
+	diagPrintf("Uptime: %lu ms\n",
 		   (unsigned long)(xTaskGetTickCount() * portTICK_PERIOD_MS));
-	FaultHandler_StallDumpPrintf("Monitored task heartbeat stalled for ~%lu ms (deadline %lu ms)\n",
+	diagPrintf("Monitored task heartbeat stalled for ~%lu ms (deadline %lu ms)\n",
 		   (unsigned long)stalledForMs, (unsigned long)ALIVE_STALL_DEADLINE_MS);
-	FaultHandler_StallDumpPrintf("Heap: free=%u  min-ever-free=%u  largest-block=%u (bytes)\n",
+	diagPrintf("Heap: free=%u  min-ever-free=%u  largest-block=%u (bytes)\n",
 		   (unsigned)heap.xAvailableHeapSpaceInBytes,
 		   (unsigned)heap.xMinimumEverFreeBytesRemaining,
 		   (unsigned)heap.xSizeOfLargestFreeBlockInBytes);
-	FaultHandler_StallDumpPrintf("Name             St Pri StkFree  LifeMs     WinUs  Win%%\n");
+	diagPrintf("Name             St Pri StkFree  LifeMs     WinUs  Win%%\n");
 
 	for (UBaseType_t i = 0; i < countNow; i++)
 	{
@@ -252,7 +259,7 @@ static void dumpSystemStateOnStall(uint32_t stalledForMs)
 
 		/* 64-bit run-time counters (configRUN_TIME_COUNTER_TYPE): print with %llu
 		 * so nothing is truncated on a long-running board. */
-		FaultHandler_StallDumpPrintf("%-16s %c  %2lu  %6lu  %8llu  %8llu  %3lu\n",
+		diagPrintf("%-16s %c  %2lu  %6lu  %8llu  %8llu  %3lu\n",
 			   snapNow[i].pcTaskName,
 			   st,
 			   (unsigned long)snapNow[i].uxCurrentPriority,
@@ -262,35 +269,25 @@ static void dumpSystemStateOnStall(uint32_t stalledForMs)
 			   winPct);
 	}
 
-	FaultHandler_StallDumpPrintf("Legend: St= R running / r ready / B blocked / S suspended | "
+	diagPrintf("Legend: St= R running / r ready / B blocked / S suspended | "
 		   "StkFree=free stack words | Win%%=CPU share over the last supervisor cycle\n");
-	/* DEBUG: the canary's only indefinite block is the CYW43 lock, so if it is
-	 * shown Blocked above, this names the task hogging that lock - the suspect. */
-	FaultHandler_StallDumpPrintf("CYW43 async_context lock currently held by: %s\n", cyw43LockHolderName());
 
-	/* DEBUG: bus-level probe - explains WHY the ioctls are timing out, which the
-	 * task table above cannot show (it only ever names whoever queued on the
-	 * lock, which is a symptom). */
+	/* Bus-level probe - explains WHY the ioctls are timing out, which the task
+	 * table above cannot show (it only names whoever queued on the CYW43 lock,
+	 * and that is always a symptom rather than the cause). */
 	dumpCyw43Probe();
 
-	FaultHandler_StallDumpPrintf("FROZEN for inspection - watchdog still being petted, NO reset.\n"
+	diagPrintf("FROZEN for inspection - watchdog still being petted, NO reset.\n"
 		   "This dump repeats every ~%lu ms. Power-cycle to recover.\n",
 		   (unsigned long)(FREEZE_REDUMP_TICKS * 250U));
-	FaultHandler_StallDumpPrintf("=========================================================\n");
-
-	/* Seal the RAM copy so the next boot recognises it as valid, THEN echo it
-	 * live over the raw UART. The seal happens first and lock-free, so even if
-	 * the echo (or the impending reset) is cut short the dump still survives for
-	 * the next boot's park loop to replay. */
-	FaultHandler_StallDumpCommit();
-	FaultHandler_StallDumpEcho();
+	diagPrintf("=========================================================\n");
 }
 
 /*
  * Function: dumpCyw43Probe
  *
- * Description: DEBUG (stall hunt). Interrogates the CYW43 wifi chip's bus
- * interface at stall time to explain WHY every ioctl is timing out.
+ * Description: Interrogates the CYW43 wifi chip's bus interface at stall time to
+ * explain WHY every ioctl is timing out.
  *
  * Background. The driver logs `STALL(0;204-204): timeout` - see
  * cyw43_sdpcm_send_common() in cyw43_ll.c. Decoded that is wlan_flow_control=0,
@@ -354,49 +351,50 @@ static void dumpCyw43Probe(void)
 		if (now != last) { transitions++; last = now; }
 	}
 
-	FaultHandler_StallDumpPrintf("--- CYW43 bus probe ---\n");
-	FaultHandler_StallDumpPrintf("WL_HOST_WAKE(GP%u): first=%d last=%d high=%lu/%lu samples, %lu transitions over %lu ms\n",
+	diagPrintf("--- CYW43 bus probe ---\n");
+	diagPrintf("WL_HOST_WAKE(GP%u): first=%d last=%d high=%lu/%lu samples, %lu transitions over %lu ms\n",
 		   (unsigned)CYW43_PIN_WL_HOST_WAKE, first, last,
 		   (unsigned long)highs, (unsigned long)samples,
 		   (unsigned long)transitions,
 		   (unsigned long)(sampleWindowUs / 1000U));
-	FaultHandler_StallDumpPrintf("cyw43_ll_has_work: %s\n",
+	diagPrintf("cyw43_ll_has_work: %s\n",
 		   cyw43_ll_has_work(&cyw43_state.cyw43_ll) ? "YES (chip wants service)" : "no (chip silent)");
 
 	/* Driver-level state, read without the lock - tells us whether the driver
-	 * still believes it is associated while the chip is unreachable. */
-	FaultHandler_StallDumpPrintf("cyw43_state: initted=%d itf_state=0x%02x join_state=0x%lx scan_state=0x%lx\n",
+	 * still believes it is associated while the chip is unreachable. join_state
+	 * decodes via WIFI_JOIN_STATE_* in cyw43_ctrl.c: 0x0e01 (ACTIVE|AUTH|LINK|
+	 * KEYED) is fully joined; 0x601 means the WPA key exchange never completed. */
+	diagPrintf("cyw43_state: initted=%d itf_state=0x%02x join_state=0x%lx scan_state=0x%lx\n",
 		   (int)cyw43_state.initted,
 		   (unsigned)cyw43_state.itf_state,
 		   (unsigned long)cyw43_state.wifi_join_state,
 		   (unsigned long)cyw43_state.wifi_scan_state);
-	FaultHandler_StallDumpPrintf("cyw43_state pending: disassoc=%d rejoin=%d rejoin_wpa=%d\n",
+	diagPrintf("cyw43_state pending: disassoc=%d rejoin=%d rejoin_wpa=%d\n",
 		   (int)cyw43_state.pend_disassoc,
 		   (int)cyw43_state.pend_rejoin,
 		   (int)cyw43_state.pend_rejoin_wpa);
-	FaultHandler_StallDumpPrintf("Read as: pin never high -> chip hung/asleep (chip-side). "
+	diagPrintf("Read as: pin never high -> chip hung/asleep (chip-side). "
 		   "pin high or toggling -> host RX path not draining it (host-side).\n");
 }
 
 /*
  * Function: freezeForInspection
  *
- * Description: DEBUG (stall hunt). Never returns. Instead of letting the board
- * reset, hold it in the stalled state indefinitely and keep re-dumping, so the
- * evidence waits for the observer instead of the other way round.
+ * Description: Never returns. Instead of letting the board reset, hold it in the
+ * stalled state indefinitely and keep re-dumping, so the evidence waits for the
+ * observer instead of the other way round.
  *
- * Why this beats every reset-based capture we tried: a reset destroys the live
- * state, so the dump had to survive in RAM the bootloader may reuse, AND a
- * terminal had to be recording at the exact instant of the crash. Three stalls in
- * a row produced nothing usable for exactly those reasons. Frozen, the board just
- * keeps reprinting the full task table until someone connects.
+ * Why this beats capturing across a reset: a reset destroys the live state, so
+ * the dump would have to survive in RAM the bootloader may reuse AND a terminal
+ * would have to be recording at the exact instant of the crash. Frozen, the
+ * board just keeps reprinting the full task table until someone connects.
  *
  * Mechanics:
  *   - the hardware watchdog keeps being petted here, so it never fires;
  *   - vTaskDelay (not busy-wait) is used deliberately: the rest of the system
  *     keeps running exactly as it was, so the wedge stays genuine and the Win%
  *     column keeps showing who is really burning CPU;
- *   - each redump re-samples live state and echoes it over the raw, lock-free
+ *   - each redump re-samples live state and writes it over the raw, lock-free
  *     UART path, so it cannot deadlock on the stdio mutex;
  *   - the CPU window in every redump is measured against the LAST HEALTHY cycle's
  *     snapshot, so Win% accumulates over the whole frozen period - a hog stands
@@ -426,35 +424,7 @@ static void freezeForInspection(void)
 		dumpSystemStateOnStall(stalledForMs);
 	}
 }
-
-/*
- * Function: printSavedStallDump
- *
- * Description: Park-loop callback (see CriticalErrorParkEx()): replays the
- * stall dump the PREVIOUS boot saved to reset-surviving RAM moments before the
- * watchdog fired, so the full task table from the moment of failure reaches a
- * terminal attached at any later time - the scratch-register breadcrumb alone
- * cannot name a CPU hog.
- *
- * Parameters: none
- *
- * Returns: void
- */
-static void printSavedStallDump(void)
-{
-	const char *dump = FaultHandler_GetSavedStallDump();
-	if (dump != NULL)
-	{
-		printf("---- System state captured at the moment of the stall (previous boot): ----\n");
-		printf("%s", dump);
-		printf("---------------------------------------------------------------------------\n");
-	}
-	else
-	{
-		printf("           (no stall dump survived in RAM - power was cycled, RAM was\n"
-			   "            clobbered, or the stall was never seen by the supervisor)\n");
-	}
-}
+#endif /* WATCHDOG_STALL_DIAGNOSTICS */
 
 /*******************************************************************************/
 /*                          GLOBAL FUNCTION DEFINITIONS                        */
@@ -465,23 +435,17 @@ void WatchdogSupervisor_HandleBootResetCause(void)
 	/* A scratch register is a small, temporary storage location built into the
 	 * hardware of a microcontroller peripheral (here, the watchdog). scratch[0]
 	 * retains its value through a soft/watchdog reset (but is lost on power-off),
-	 * so we use it as a boot-to-boot reset counter for reporting.
+	 * so we use it as a boot-to-boot reset counter.
 	 *
-	 * ------------------------------------------------------------------------
-	 * DIAGNOSTIC POLICY: park on the FIRST unexpected watchdog reset.
-	 * ------------------------------------------------------------------------
-	 * The watchdog is only ever supposed to reset us in two situations:
-	 *   (a) an intentional reboot (reset_system() -> RequestReset(), e.g. OTA) -
-	 *       which is tagged "clean" and is NOT a fault, or
-	 *   (b) something actually went wrong (a recorded fault/stall, or an
-	 *       unexplained hardware timeout).
+	 * Policy: reset and continue. A single watchdog reset is a recovery, not a
+	 * fault to trap on - the board must get itself working again unattended.
+	 * Only a genuine boot loop (MAX_WATCHDOG_RESETS resets that never reach
+	 * HEALTHY_UPTIME_MS) parks the board, because at that point resetting again
+	 * clearly is not helping. The cause is logged either way.
 	 *
-	 * For (b) we do NOT auto-recover and we do NOT wait for repeated resets to
-	 * pile up. We trap immediately and keep printing WHAT caused it, so an
-	 * intermittent watchdog reset is caught on occurrence #1 instead of only
-	 * after a rare "perfect storm" of back-to-back resets. This makes the board
-	 * non-self-healing on purpose - it is a debugging trap. Relax it back to a
-	 * counter/threshold policy once the root cause is understood. */
+	 * To investigate a stall rather than recover from it, build with
+	 * -DWATCHDOG_STALL_DIAGNOSTICS=ON: the supervisor then freezes and dumps
+	 * instead of ever reaching a reset. */
     if (!watchdog_enable_caused_reboot())
 	{
         /* Fresh power-on or external reset - not a watchdog event. */
@@ -502,22 +466,28 @@ void WatchdogSupervisor_HandleBootResetCause(void)
         return;
     }
 
-    /* Unexpected watchdog reset -> trap. Either we have a decoded cause
+    /* Unexpected watchdog reset. Either we have a decoded cause
      * (LAST_RESET_FAULT) or nothing recorded it (LAST_RESET_NONE), which is
      * itself a strong clue: a scheduler-level wedge / IRQs disabled / the
      * supervisor task starved - nothing in the system got to write a cause. */
     watchdog_hw->scratch[0] = watchdog_hw->scratch[0] + 1;
+    uint32_t count = watchdog_hw->scratch[0];
 
     const char *cause = (cls == LAST_RESET_FAULT)
         ? FaultHandler_GetLastCause()
         : "unexplained watchdog timeout - no breadcrumb "
           "(scheduler-level hang / IRQs off / supervisor task starved)";
 
-    LOG("Unexpected watchdog reset (#%lu) - parking to preserve cause: %s\n",
-        (unsigned long)watchdog_hw->scratch[0], cause);
+    LOG("Watchdog reset detected (#%lu of %d): %s\n",
+        (unsigned long)count, MAX_WATCHDOG_RESETS, cause);
 
-    watchdog_disable();
-    CriticalErrorParkEx(MODULE_ID_OS, ERROR_ID_WATCHDOG_RESETS, cause, printSavedStallDump);
+    if (count >= MAX_WATCHDOG_RESETS)
+    {
+        /* Boot loop: resetting is not recovering us. Stop and preserve why. */
+        LOG("Too many watchdog resets without healthy uptime - entering error state\n");
+        watchdog_disable();
+        CriticalErrorParkEx(MODULE_ID_OS, ERROR_ID_WATCHDOG_RESETS, cause, NULL);
+    }
 }
 
 void WatchdogSupervisor_Enable(void)
@@ -537,10 +507,14 @@ void WatchdogSupervisor_Init(void)
 	s_supervisorTaskHandle = xTaskGetCurrentTaskHandle();
 	s_lastSeenHeartbeat    = s_aliveHeartbeat;
 	s_lastProgressTick     = xTaskGetTickCount();
+	s_bootTick             = s_lastProgressTick;
+	s_decayCleared         = false;
 	s_stalled              = false;
 
+#if defined(WATCHDOG_STALL_DIAGNOSTICS)
 	/* Prime the 'previous' snapshot so the first stall window has a baseline. */
 	snapPrevCount = uxTaskGetSystemState(snapPrev, MAX_NUM_OF_TASKS, &prevTotalRunTime);
+#endif
 }
 
 void WatchdogSupervisor_MainFunction(void)
@@ -561,6 +535,16 @@ void WatchdogSupervisor_MainFunction(void)
 		return;
 	}
 
+	/* Once we have run cleanly for a while, forget past watchdog resets so
+	 * isolated transient faults spread over days cannot accumulate into a false
+	 * boot-loop trip. */
+	if (!s_decayCleared &&
+		((uint32_t)pdTICKS_TO_MS(now - s_bootTick) >= HEALTHY_UPTIME_MS))
+	{
+		watchdog_hw->scratch[0] = 0;
+		s_decayCleared = true;
+	}
+
 	/* Track monitored-task liveness. */
 	uint32_t hb = s_aliveHeartbeat;
 	if (hb != s_lastSeenHeartbeat)
@@ -573,34 +557,34 @@ void WatchdogSupervisor_MainFunction(void)
 
 	if (sinceProgressMs >= ALIVE_STALL_DEADLINE_MS)
 	{
-		/* Stall: leave a cross-reset breadcrumb (so the cause is announced on the
-		 * next boot too), print a full live dump, then freeze for inspection.
-		 *
-		 * The breadcrumb carries the monitored task's state plus the CYW43 lock
-		 * holder: for the common Blocked case that names the culprit in the park
-		 * line without needing the live dump to have been captured. The monitored
-		 * task is always the alive canary, so we do not spend a scratch slot on
-		 * its (known) name. */
-		eTaskState  st     = (s_monitoredTaskHandle != NULL)
+		/* Stall: leave a cross-reset breadcrumb so the cause is announced on the
+		 * next boot, then stop petting and let the watchdog reset us. The
+		 * monitored task is always the alive canary, so we do not spend a scratch
+		 * slot on its (known) name - just its state at detection. */
+		eTaskState st = (s_monitoredTaskHandle != NULL)
 			? eTaskGetState(s_monitoredTaskHandle) : eInvalid;
-		const char *holder = cyw43LockHolderName();
 
-		FaultHandler_RecordWatchdogStall((uint32_t)st, holder);
-		dumpSystemStateOnStall(sinceProgressMs);
+		FaultHandler_RecordWatchdogStall((uint32_t)st);
 		s_stalled = true;
 
-		/* DEBUG (stall hunt): do NOT stop petting - freeze here instead and keep
-		 * reprinting the live state forever. Never returns. The breadcrumb above
-		 * is still recorded so that an unrelated reset (brownout, power blip)
-		 * would still be explained on the next boot. */
+#if defined(WATCHDOG_STALL_DIAGNOSTICS)
+		/* Diagnostic build: never reach the reset. Dump the live state and hold
+		 * the board here, re-dumping forever, so the evidence waits for whoever
+		 * attaches a terminal. Never returns. */
+		dumpSystemStateOnStall(sinceProgressMs);
 		freezeForInspection();
+#endif
 	}
 	else
 	{
-		/* Healthy: pet the watchdog and roll the snapshot so the next cycle's
-		 * stall window has a fresh baseline to diff against. */
+		/* Healthy: pet the watchdog. */
 		watchdog_update();
+
+#if defined(WATCHDOG_STALL_DIAGNOSTICS)
+		/* Roll the snapshot so the next cycle's stall window has a fresh baseline
+		 * to diff against. */
 		snapPrevCount = uxTaskGetSystemState(snapPrev, MAX_NUM_OF_TASKS, &prevTotalRunTime);
+#endif
 	}
 }
 

@@ -108,6 +108,9 @@
  * the observed timeout duration (~1005 ms). */
 #define CYW43_IOCTL_TIMEOUT_LIKELY_US		((uint32_t)950000)
 
+/* Consecutive failed blinks before the alive task declares the wifi chip dead. */
+#define LED_FAILURES_BEFORE_ERROR			((uint8_t)3)
+
 /* Stack sizes - This parameter is in WORDS (on Pico W: 1 word = 32bit = 4bytes) */ 
 #define STACK_1024_BYTES					(configSTACK_DEPTH_TYPE)(256) 
 #define STACK_2048_BYTES					(configSTACK_DEPTH_TYPE)(512) 
@@ -431,9 +434,6 @@ static void aliveTask(__unused void *taskParams)
 #if (ALIVE_LED_ENABLED == ON)
 	static bool state_LED;
 	static uint8_t consecutiveFailures = 0;
-	/* DEBUG (stall hunt): latched once the LED/ioctl path is declared dead, so the
-	 * heartbeat is withheld and the "declared dead" line is logged only once. */
-	static bool ledDeclaredDead = false;
 #endif
 
 	/* Initialize xLastWakeTime - this only needs to be done once. */
@@ -453,74 +453,22 @@ static void aliveTask(__unused void *taskParams)
 			In FreeRTOS where we use the pico_cyw43_arch_lwip_sys_freertos library, a dedicated task is used to process these events */
 		async_context_t *context = cyw43_arch_async_context();
 
-		/* DEBUG: time the two halves of the "blink" - waiting for the CYW43 lock
-		 * and the cyw43_gpio_set ioctl itself. Remove together with the DEBUG
-		 * watchdog-trap commits. */
-		uint64_t dbgT0Us = time_us_64();
-
-		/* How long the ioctl actually took, hoisted out of the DEBUG block below
-		 * because the health check needs it (see the failure handling further
-		 * down - the driver discards the real error, so duration is the signal). */
-		uint32_t dbgGpioUsForHealth = 0;
-
 		/* Acquire the lock */
 		async_context_acquire_lock_blocking(context);
 
-		uint64_t dbgT1Us = time_us_64(); /* DEBUG */
+		/* Time the ioctl itself. This is not instrumentation - it is the health
+		 * check: cyw43_ll_gpio_set() discards the ioctl's error and always
+		 * returns 0, so its duration is the only evidence we get that the wifi
+		 * chip stopped answering (see the failure handling below). */
+		uint64_t ioctlStartUs = time_us_64();
 
 		/* Set the state of the LED */
 		int ret = cyw43_gpio_set(&cyw43_state, CYW43_WL_GPIO_LED_PIN, state_LED);
 
+		uint32_t ioctlUs = (uint32_t)(time_us_64() - ioctlStartUs);
+
 		/* Release the lock */
 		async_context_release_lock(context);
-
-		/* DEBUG: blink timing stats. Immediate warning for any suspiciously slow
-		 * blink, plus a min/avg/max summary once a minute. */
-		{
-			uint64_t dbgT2Us = time_us_64();
-			uint32_t dbgLockUs = (uint32_t)(dbgT1Us - dbgT0Us);
-			uint32_t dbgGpioUs = (uint32_t)(dbgT2Us - dbgT1Us);
-
-			dbgGpioUsForHealth = dbgGpioUs;
-
-			static uint32_t dbgCount = 0;
-			static uint32_t dbgLockMaxUs = 0;
-			static uint32_t dbgGpioMinUs = UINT32_MAX;
-			static uint32_t dbgGpioMaxUs = 0;
-			static uint64_t dbgGpioSumUs = 0;
-			static uint32_t dbgBootMaxTotalUs = 0;
-
-			if (dbgLockUs > dbgLockMaxUs) { dbgLockMaxUs = dbgLockUs; }
-			if (dbgGpioUs < dbgGpioMinUs) { dbgGpioMinUs = dbgGpioUs; }
-			if (dbgGpioUs > dbgGpioMaxUs) { dbgGpioMaxUs = dbgGpioUs; }
-			dbgGpioSumUs += dbgGpioUs;
-			dbgCount++;
-
-			uint32_t dbgTotalUs = dbgLockUs + dbgGpioUs;
-			if (dbgTotalUs > dbgBootMaxTotalUs) { dbgBootMaxTotalUs = dbgTotalUs; }
-
-			if (dbgTotalUs > 50000U) /* > 50 ms: log it the moment it happens */
-			{
-				LOG("[DEBUG] SLOW BLINK: lock wait %lu us, gpio_set %lu us\n",
-					(unsigned long)dbgLockUs, (unsigned long)dbgGpioUs);
-			}
-
-			if (dbgCount >= 120U) /* ~1 min at the 500 ms period */
-			{
-				LOG("[DEBUG] blink timing (last %lu): gpio_set min/avg/max = %lu/%lu/%lu us, lock wait max = %lu us, worst blink since boot = %lu us\n",
-					(unsigned long)dbgCount,
-					(unsigned long)dbgGpioMinUs,
-					(unsigned long)(dbgGpioSumUs / dbgCount),
-					(unsigned long)dbgGpioMaxUs,
-					(unsigned long)dbgLockMaxUs,
-					(unsigned long)dbgBootMaxTotalUs);
-				dbgCount = 0;
-				dbgLockMaxUs = 0;
-				dbgGpioMinUs = UINT32_MAX;
-				dbgGpioMaxUs = 0;
-				dbgGpioSumUs = 0;
-			}
-		}
 
 		/* Check if the LED was set successfully.
 		 *
@@ -535,49 +483,25 @@ static void aliveTask(__unused void *taskParams)
 		 * (CYW43_IOCTL_TIMEOUT_US, 1 s) as a failure. A healthy gpio_set is a few
 		 * ms; only a timed-out SDPCM exchange takes ~1005 ms, which makes the
 		 * duration a reliable proxy for the error the driver discarded. */
-		bool ledTimedOut = (dbgGpioUsForHealth >= CYW43_IOCTL_TIMEOUT_LIKELY_US);
+		bool ledTimedOut = (ioctlUs >= CYW43_IOCTL_TIMEOUT_LIKELY_US);
 
 		if((ret != 0) || ledTimedOut)
 		{
 			consecutiveFailures++;
 			LOG("LED failure number %d (ret=%d, gpio_set %lu us%s)\n",
-				consecutiveFailures, ret, (unsigned long)dbgGpioUsForHealth,
+				consecutiveFailures, ret, (unsigned long)ioctlUs,
 				ledTimedOut ? ", ioctl TIMEOUT - wifi chip not responding" : "");
 
-			if(consecutiveFailures >= 3)
+			if(consecutiveFailures >= LED_FAILURES_BEFORE_ERROR)
 			{
-				/* DEBUG (stall hunt): deliberately do NOT call
-				 * CriticalErrorHandler() here. That parks via
-				 * CriticalErrorPark(.., NULL), which prints a bare
-				 * "PARKED moduleId/errorId" line with no task table and no CYW43
-				 * bus probe - strictly less than the watchdog supervisor's freeze
-				 * dump. And it would win the race: three consecutive ~1005 ms ioctl
-				 * timeouts take ~3 s, inside the supervisor's 4 s stall deadline,
-				 * so parking here would destroy exactly the evidence we are trying
-				 * to collect.
-				 *
-				 * Instead simply stop claiming to be alive (below). That is also
-				 * the honest signal - the blink genuinely is not completing - and
-				 * it routes the failure into the single existing diagnostic path:
-				 * the supervisor notices the stale heartbeat within 4 s and runs
-				 * the full dump, CYW43 probe included, then freezes.
-				 *
-				 * Restore the CriticalErrorHandler() call when the DEBUG stall-hunt
-				 * commits are reverted. */
-				if(!ledDeclaredDead)
-				{
-					ledDeclaredDead = true;
-					LOG("[DEBUG] LED failed %d times in a row - wifi chip unreachable. "
-						"Withholding heartbeat so the supervisor dumps and freezes.\n",
-						consecutiveFailures);
-				}
+				/* The wifi chip is not answering at all. Enter the error state. */
+				CriticalErrorHandler(MODULE_ID_OS, ERROR_ID_LED_FAILED);
 			}
 		}
 		else
 		{
 			/* Reset the counter if the LED was set successfully */
 			consecutiveFailures = 0;
-			ledDeclaredDead = false;
 		}
 #endif
 
@@ -587,18 +511,8 @@ static void aliveTask(__unused void *taskParams)
 		 * heartbeat only advances on a fully completed iteration. If aliveTask
 		 * blocks inside the loop or is starved of CPU, the heartbeat goes stale and
 		 * the supervisor catches it. The watchdog pet itself now lives in the
-		 * supervisor, decoupled from this lowest-priority task and from WiFi.
-		 *
-		 * DEBUG (stall hunt): withheld once the LED path is declared dead. A blink
-		 * that only "completes" by burning the CYW43 ioctl timeout is not a healthy
-		 * iteration, and reporting it as one is what let the board sit with a dead
-		 * radio while the supervisor saw a perfectly steady ~1 s heartbeat. */
-#if (ALIVE_LED_ENABLED == ON)
-		if(!ledDeclaredDead)
-#endif
-		{
-			WatchdogSupervisor_ReportAlive();
-		}
+		 * supervisor, decoupled from this lowest-priority task and from WiFi. */
+		WatchdogSupervisor_ReportAlive();
 #endif
 
 	}
