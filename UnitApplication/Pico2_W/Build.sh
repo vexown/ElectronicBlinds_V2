@@ -129,7 +129,7 @@ fi
 
 # Verify pico-sdk is at the correct version
 PICO_SDK_DIR="$DEPS_DIR/pico-sdk"
-PICO_SDK_TAG="2.1.1"
+PICO_SDK_TAG="2.3.1"
 ACTUAL_TAG=$(cd "$PICO_SDK_DIR" && git describe --tags --exact-match 2>/dev/null || echo "unknown")
 if [ "$ACTUAL_TAG" != "$PICO_SDK_TAG" ]; then
     echo "pico-sdk is not at the expected version. Updating..."
@@ -138,7 +138,7 @@ fi
 
 # Verify picotool is at the correct version
 PICOTOOL_DIR="$DEPS_DIR/picotool"
-PICOTOOL_TAG="2.1.1"
+PICOTOOL_TAG="2.3.1"
 ACTUAL_TAG=$(cd "$PICOTOOL_DIR" && git describe --tags --exact-match 2>/dev/null || echo "unknown")
 if [ "$ACTUAL_TAG" != "$PICOTOOL_TAG" ]; then
     echo "picotool is not at the expected version. Updating..."
@@ -164,8 +164,10 @@ if [ "$ACTUAL_TAG" != "$DEBUGPROBE_TAG" ]; then
 fi
 
 # Build and install picotool
-# Check if picotool needs to be built/installed (always if not found in /usr/local/bin)
-if [ ! -f "/usr/local/bin/picotool" ]; then
+# Check if picotool needs to be built/installed (if not found in /usr/local/bin, or if the
+# installed version differs from PICOTOOL_TAG - the pico-sdk refuses a mismatched picotool)
+INSTALLED_PICOTOOL_VERSION=$(/usr/local/bin/picotool version 2>/dev/null | awk '{print $2}' || true)
+if [ ! -f "/usr/local/bin/picotool" ] || [ "$INSTALLED_PICOTOOL_VERSION" != "v$PICOTOOL_TAG" ]; then
     echo "Building and installing picotool..."
     
     # Create build directory if it doesn't exist

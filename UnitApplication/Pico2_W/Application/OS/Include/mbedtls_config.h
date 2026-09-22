@@ -59,7 +59,8 @@
 #define MBEDTLS_SSL_TLS_C
 #define MBEDTLS_SSL_CLI_C
 #define MBEDTLS_SSL_PROTO_TLS1_2
-#define MBEDTLS_SSL_MAX_CONTENT_LEN 16384 
+#define MBEDTLS_SSL_IN_CONTENT_LEN  16384
+#define MBEDTLS_SSL_OUT_CONTENT_LEN 16384
 
 /* Cipher modes */
 #define MBEDTLS_CCM_C
@@ -81,10 +82,10 @@
 
 /* System configuration - disabled for embedded */
 #define MBEDTLS_HAVE_TIME
+#define MBEDTLS_PLATFORM_MS_TIME_ALT  /* mbedtls_ms_time() is provided in WiFi_OTA_download.c */
 
 /* Enable debugging */
 #define MBEDTLS_DEBUG_C
 
-#include "mbedtls/check_config.h"
 
 #endif /* MBEDTLS_CONFIG_H */

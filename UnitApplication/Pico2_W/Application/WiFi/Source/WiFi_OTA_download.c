@@ -167,7 +167,17 @@ static void clean_up(mbedtls_ssl_context *p_ssl_context, mbedtls_ssl_config *p_s
 /*                  GLOBAL FUNCTION DEFINITIONS                       */
 /**********************************************************************/
 
-int download_firmware(void) 
+/**
+ * @brief Millisecond clock required by Mbed TLS 3.x when MBEDTLS_HAVE_TIME is set
+ *        (enabled via MBEDTLS_PLATFORM_MS_TIME_ALT in mbedtls_config.h).
+ *        Mbed TLS only uses it for time differences, so time since boot is enough.
+ */
+mbedtls_ms_time_t mbedtls_ms_time(void)
+{
+    return (mbedtls_ms_time_t)(time_us_64() / 1000U);
+}
+
+int download_firmware(void)
 {
     /******************************* Variable declarations/definitions *******************************/
     /* Status variable */
