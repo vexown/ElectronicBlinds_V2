@@ -27,7 +27,9 @@
  *   - Once at the correct limit, the motor stays idle until the schedule
  *     transitions.
  *   - Sunrise/sunset are recomputed from the DS3231 date whenever the date
- *     rolls over; DST is applied automatically (EU rules).
+ *     rolls over. The schedule is computed in the RTC's own time frame
+ *     (CEST, UTC+2, year-round -- see time_calculations.h), so it is compared
+ *     against the raw RTC reading and DST never enters the decision.
  */
 
 /*******************************************************************************/
@@ -98,6 +100,7 @@ static void         motor_start_down(void);
 static bool         is_daytime(float time_of_day_h);
 static float        rtc_decimal_hours(const DS3231_DateTime *dt);
 static void         recalculate_sun_schedule(const DS3231_DateTime *dt);
+static void         log_rtc_time(const DS3231_DateTime *dt);
 static void         handle_limit_switches(bool at_top, bool at_bottom);
 static void         handle_manual_buttons(bool at_top, bool at_bottom);
 static void         handle_sun_control(bool at_top, bool at_bottom);
@@ -278,9 +281,7 @@ Blinds_Status Blinds_Init(void)
     {
         s_rtc_snapshot = dt;
         recalculate_sun_schedule(&dt);
-        LOG("[Blinds] RTC: 20%02u-%02u-%02u %02u:%02u:%02u\n",
-            dt.year, dt.month, dt.date,
-            dt.hours, dt.minutes, dt.seconds);
+        log_rtc_time(&dt);
     }
     else
     {
@@ -957,9 +958,9 @@ static void motor_start_down(void)
 }
 
 /**
- * @brief Return true when the given local time-of-day falls between sunrise
+ * @brief Return true when the given RTC time-of-day falls between sunrise
  *        and (sunset + BLINDS_SUNSET_OFFSET_HOURS).
- * @param time_of_day_h  Local time of day as decimal hours (0.0–24.0).
+ * @param time_of_day_h  RTC (CEST) time of day as decimal hours (0.0–24.0).
  */
 static bool is_daytime(float time_of_day_h)
 {
@@ -968,7 +969,10 @@ static bool is_daytime(float time_of_day_h)
 }
 
 /**
- * @brief Convert a DS3231 snapshot to local time-of-day in decimal hours.
+ * @brief Convert a DS3231 snapshot to RTC time-of-day in decimal hours.
+ *
+ * This is RTC time (CEST, UTC+2, year-round), not wall-clock time. It is
+ * compared directly against the schedule, which is computed in the same frame.
  */
 static float rtc_decimal_hours(const DS3231_DateTime *dt)
 {
@@ -982,14 +986,14 @@ static float rtc_decimal_hours(const DS3231_DateTime *dt)
  */
 static void recalculate_sun_schedule(const DS3231_DateTime *dt)
 {
-    int  day_of_year = (int)CalculateDayOfYear(dt->year, dt->month, dt->date);
-    bool dst_active  = isDST(dt->year, dt->month, dt->date);
-    int  timezone    = TIME_ZONE_PLUS_TO_E + (dst_active ? 1 : 0);
+    int day_of_year = (int)CalculateDayOfYear(dt->year, dt->month, dt->date);
 
+    /* Sunrise and sunset are physical instants, so expressing them in the
+     * RTC's fixed UTC+2 frame is exact all year; no DST adjustment needed. */
     float sunrise_h = 0.0f;
     float sunset_h  = 0.0f;
     CalculateSunriseSunset((float)LATITUDE_SIEROSZEWICE, (float)LONGITUDE_SIEROSZEWICE,
-                           day_of_year, timezone, &sunrise_h, &sunset_h);
+                           day_of_year, RTC_UTC_OFFSET_HOURS, &sunrise_h, &sunset_h);
 
     s_sunrise_hours       = sunrise_h;
     s_sunset_cutoff_hours = sunset_h + BLINDS_SUNSET_OFFSET_HOURS;
@@ -1000,8 +1004,29 @@ static void recalculate_sun_schedule(const DS3231_DateTime *dt)
     uint8_t sr_m = (uint8_t)((sunrise_h - (float)sr_h) * 60.0f);
     uint8_t ss_h = (uint8_t)s_sunset_cutoff_hours;
     uint8_t ss_m = (uint8_t)((s_sunset_cutoff_hours - (float)ss_h) * 60.0f);
-    LOG("[Blinds] Sun schedule for %02u-%02u: sunrise=%02u:%02u, lower-at=%02u:%02u (DST=%d).\n",
-        dt->month, dt->date, sr_h, sr_m, ss_h, ss_m, (int)dst_active);
+    LOG("[Blinds] Sun schedule for %02u-%02u (RTC/CEST time): sunrise=%02u:%02u, lower-at=%02u:%02u.\n",
+        dt->month, dt->date, sr_h, sr_m, ss_h, ss_m);
+}
+
+/**
+ * @brief Log the raw RTC time (CEST) alongside the derived wall-clock time.
+ *
+ * Logging only -- the control logic works on raw RTC time. Outside DST the
+ * wall clock is one hour behind the RTC; between RTC 00:00 and 01:00 in
+ * winter that puts it on the previous day, so the hour wraps to 23 and the
+ * date is marked with "(-1d)" instead of being rolled back.
+ */
+static void log_rtc_time(const DS3231_DateTime *dt)
+{
+    bool    dst      = isDST(dt->year, dt->month, dt->date, dt->hours);
+    uint8_t behind_h = (uint8_t)(dst ? 0 : (RTC_UTC_OFFSET_HOURS - STANDARD_UTC_OFFSET_HOURS));
+    bool    prev_day = dt->hours < behind_h;
+    uint8_t local_h  = (uint8_t)((dt->hours + 24U - behind_h) % 24U);
+
+    LOG("[Blinds] RTC: 20%02u-%02u-%02u %02u:%02u:%02u (CEST) -> local %02u:%02u:%02u %s%s\n",
+        dt->year, dt->month, dt->date, dt->hours, dt->minutes, dt->seconds,
+        local_h, dt->minutes, dt->seconds,
+        dst ? "(CEST)" : "(CET)", prev_day ? " (-1d)" : "");
 }
 
 /* --- Motion bookkeeping --------------------------------------------------- */

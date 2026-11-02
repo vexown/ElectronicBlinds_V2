@@ -15,7 +15,23 @@
 /*******************************************************************************/
 #define LATITUDE_SIEROSZEWICE    (51.63394) //in degrees
 #define LONGITUDE_SIEROSZEWICE   (17.96725) //in degrees
-#define TIME_ZONE_PLUS_TO_E      (1)        //UTC+1 for Poland in winter, UTC+2 in summer (DST)
+
+/*
+ * DS3231 TIME CONVENTION -- READ BEFORE SETTING THE RTC
+ *
+ * The DS3231 always holds Polish SUMMER time (CEST, UTC+2), all year round.
+ * It is never adjusted for DST, neither by hand nor by the firmware.
+ *
+ *   - Setting it in summer: set it to the wall-clock time.
+ *   - Setting it in winter: set it ONE HOUR AHEAD of the wall clock.
+ *
+ * The blinds schedule is computed directly in this UTC+2 frame and compared
+ * against the raw RTC reading, so DST never enters the control logic.
+ * Local (wall-clock) time is derived only for logging: see isDST().
+ */
+#define RTC_UTC_OFFSET_HOURS     (2)        //DS3231 holds CEST (UTC+2) year-round
+#define STANDARD_UTC_OFFSET_HOURS (1)       //Polish standard (winter) time, CET (UTC+1)
+#define DST_SWITCH_RTC_HOUR      (3U)       //EU switches at 01:00 UTC = 03:00 on the CEST RTC, both in March and October
 
 #define BCD_TO_DEC 1
 #define DEC_TO_BCD 0
@@ -72,16 +88,19 @@ void CalculateSunriseSunset(float latitude, float longitude, int dayOfYear, int 
 uint32_t CalculateDayOfYear(uint8_t year, uint8_t month, uint8_t day);
 
 /**
- * @brief Determines if Daylight Saving Time (DST) is active for a given date.
+ * @brief Determines if Daylight Saving Time (DST) is active at a given RTC time.
  * This implementation follows the European Union standard: DST starts on the
- * last Sunday of March and ends on the last Sunday of October.
- * @param year   Year within the 2000s (0–99, e.g. 25 for 2025).
- * @param month  Month, 1–12.
- * @param day    Day of month, 1–31.
- * @return true  If the date falls within the DST period.
- * @return false If the date is in standard time.
+ * last Sunday of March and ends on the last Sunday of October, both at
+ * 01:00 UTC. Because the RTC holds CEST (UTC+2) year-round, that instant is
+ * 03:00 RTC time on both changeover days (DST_SWITCH_RTC_HOUR).
+ * @param year   RTC year within the 2000s (0–99, e.g. 25 for 2025).
+ * @param month  RTC month, 1–12.
+ * @param day    RTC day of month, 1–31.
+ * @param hour   RTC hour, 0–23 (CEST, see the DS3231 time convention above).
+ * @return true  If DST is in effect at that moment.
+ * @return false If standard time is in effect.
  */
-bool isDST(uint8_t year, uint8_t month, uint8_t day);
+bool isDST(uint8_t year, uint8_t month, uint8_t day, uint8_t hour);
 
 /**
  * @brief Converts values between Decimal and Binary Coded Decimal (BCD).

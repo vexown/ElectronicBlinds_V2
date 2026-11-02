@@ -46,7 +46,7 @@ uint8_t ConvertBCD(uint16_t valueToConvert, uint8_t direction)
     return convertedValue;
 }
 
-bool isDST(uint8_t year, uint8_t month, uint8_t day)
+bool isDST(uint8_t year, uint8_t month, uint8_t day, uint8_t hour)
 {
     bool isTodayDST = false;
 
@@ -54,7 +54,7 @@ bool isDST(uint8_t year, uint8_t month, uint8_t day)
     uint32_t monthDEC = month;
     uint32_t yearDEC = (uint32_t)year + 2000U; /* This code only works for 2nd millennium, should be enough lol */
 
-    /* Check if DST is in effect (last Sunday in March to last Sunday in October) */
+    /* Check if DST is in effect (last Sunday in March 03:00 RTC to last Sunday in October 03:00 RTC) */
     if (monthDEC >= 3 && monthDEC <= 10) 
     {
         uint32_t lastSundayInMonth = 31; // Default to last day of the month
@@ -66,17 +66,18 @@ bool isDST(uint8_t year, uint8_t month, uint8_t day)
             {
                 lastSundayInMonth--;
             }
-            if((dayDEC >= lastSundayInMonth) && (monthDEC == 3)) /* If first, or any later, day of DST in March */
+            if (dayDEC == lastSundayInMonth) /* Changeover day: switch at 03:00 RTC (CEST) = 01:00 UTC */
             {
-                isTodayDST = true;
+                isTodayDST = (monthDEC == 3) ? (hour >= DST_SWITCH_RTC_HOUR)  /* March: DST from 03:00 on */
+                                             : (hour <  DST_SWITCH_RTC_HOUR); /* October: DST until 03:00 */
             }
-            else if((dayDEC <= lastSundayInMonth) && (monthDEC == 10)) /* If last, or any previous, day of DST in October */
+            else if (monthDEC == 3) /* March: DST after the last Sunday */
             {
-                isTodayDST = true;
+                isTodayDST = (dayDEC > lastSundayInMonth);
             }
-            else /* If in March before DST starts (last Sunday) or if in October after DST ends (last Sunday) */
+            else /* October: DST before the last Sunday */
             {
-                isTodayDST = false; 
+                isTodayDST = (dayDEC < lastSundayInMonth);
             }
         }
         else /* Months from 4 to 9 */
@@ -119,7 +120,7 @@ uint32_t CalculateDayOfYear(uint8_t year, uint8_t month, uint8_t day)
 
 /* Use https://gml.noaa.gov/grad/solcalc/ and the excel doc at: https://gml.noaa.gov/grad/solcalc/calcdetails.html 
    for reference/calibration of your sunset/sunrise functions! */
-/* The calculation will be accurate for DST time of the given time zone (Poland is E(east) + 2) */
+/* timeZone is the UTC offset the results are expressed in; the blinds pass RTC_UTC_OFFSET_HOURS (CEST, +2) */
 /* Function to calculate the sunrise and sunset times based on NOAA solar calculator */
 void CalculateSunriseSunset(float latitude, float longitude, int dayOfYear, int timeZone, float* sunrise, float* sunset) 
 {

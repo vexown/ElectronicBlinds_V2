@@ -45,8 +45,9 @@
  * The controller raises the blinds at local sunrise and lowers them
  * BLINDS_SUNSET_OFFSET_HOURS after local sunset. Sunrise and sunset are
  * computed from the DS3231 date using the NOAA solar algorithm for the
- * configured latitude/longitude (see time_calculations.h). DST is applied
- * automatically for the EU schedule.
+ * configured latitude/longitude (see time_calculations.h). The DS3231 holds
+ * CEST (UTC+2) year-round and is never adjusted for DST; the schedule is
+ * computed in that same frame, so no DST handling is needed for control.
  *
  * @section ManualOverride
  *
